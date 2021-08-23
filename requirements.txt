@@ -1,0 +1,5 @@
+jaxlib
+jax
+dm-haiku
+optax
+chex
