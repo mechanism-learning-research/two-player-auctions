@@ -486,13 +486,13 @@ def test(tpal, tpal_state):
 
 
 # Short training, for tests
-tpal, state = training(1000, 50, 500, 1000, 100, 10, 5, 200, 7)
+tpal, state = training(1000, 50, 500, 1000, 100, 5, 10, 200, 7)
 # Medium length training
-# tpal, state = training(50000, 50, 500, 1000, 100, 10, 5, 200, 7)
+# tpal, state = training(50000, 50, 500, 1000, 100, 5, 10, 200, 7)
 # Long training
-# tpal, state = training(200000, 50, 1200, 50000, 100, 10, 5, 200, 7)
+# tpal, state = training(200000, 50, 1200, 50000, 100, 5, 10, 200, 7)
 # Full training, large batches, high # of misreport updates
-# tpal, state = training(200000, 100, 1200, 50000, 500, 10, 5, 200, 7)
+# tpal, state = training(200000, 100, 1200, 50000, 500, 5, 10, 200, 7)
 
 print("Metrics of Two-Player Auction Learner")
 test(tpal, state)
