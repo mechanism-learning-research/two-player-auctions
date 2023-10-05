@@ -1,5 +1,6 @@
 # Copyright 2020 DeepMind Technologies Limited. All Rights Reserved.
 # Copyright 2021 Daniel Reusche
+# Copyright 2023 Tarek Sabet
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,8 +29,37 @@ import jax.nn as nn
 
 from chex import assert_shape, assert_equal_shape
 
+import joblib
+
+from sacred import Experiment
+from sacred.observers import SqlObserver
+
+# Create a new experiment
+ex = Experiment("auction_experiment")
+
+# Attach an SQLite observer
+ex.observers.append(SqlObserver("sqlite:///results.db"))
+
+
+# Define configurations for the experiment
+@ex.config
+def cfg():
+    num_steps = 1000  # Default value, can be overwritten when running the script
+    num_test_samples = 10
+    misr_updates = 50
+    misr_reinit_iv = 500
+    misr_reinit_lim = 1000
+    batch_size = 100
+    bidders = 5
+    items = 10
+    net_width = 200
+    net_depth = 7
+    # val_dist = ...  # TODO: add when ready
+
+
 # Uncomment to disable asserts
 # chex.disable_asserts()
+
 
 # Model
 class BidSampler:
@@ -385,7 +415,9 @@ class TPAL:
 
 
 # Train a two player auction learner and return it with state.
+@ex.capture  # sacred experiment tracking decoration
 def training(
+    _run,  # for sacred logging
     num_steps,
     misr_updates,
     misr_reinit_iv,
@@ -400,12 +432,6 @@ def training(
     # @title {vertical-output: true}
 
     log_every = num_steps // 100
-
-    # Let's see what hardware we're working with. The training takes a few
-    # minutes on a GPU, a bit longer on CPU.
-    print(f"Number of devices: {jax.device_count()}")
-    print("Device:", jax.devices()[0].device_kind)
-    print("")
 
     # The model.
     tpal = TPAL(bidders, items, net_width, net_depth)
@@ -452,6 +478,11 @@ def training(
                 f"Step {step}: "
                 f"auct_loss = {auct_loss:.3f}, misr_loss = {misr_loss:.3f}"
             )
+
+            # Logging Losses
+            _run.log_scalar("losses.auct_loss", auct_loss, step)
+            _run.log_scalar("losses.misr_loss", misr_loss, step)
+
             steps.append(step)
             auct_losses.append(auct_loss)
             misr_losses.append(misr_loss)
@@ -459,11 +490,17 @@ def training(
     return tpal, tpal_state
 
 
-def test(tpal, tpal_state):
+# TODO vectorize and process all samples in parallel
+def test(tpal, tpal_state, num_samples):
     rng = jax.random.PRNGKey(1337)
     sampler = BidSampler(rng, tpal.bidders, tpal.items)
 
-    for _ in range(0, 10):
+    total_truth_util = 0
+    total_misr_util = 0
+    total_regret = 0
+    total_pay = 0
+
+    for _ in range(num_samples):
         val_sample = sampler.sample(1)
 
         # Receive an auction
@@ -472,27 +509,65 @@ def test(tpal, tpal_state):
         # Receive misreports
         misreports = tpal.misr_transform.apply(tpal_state.params.misr, val_sample)
 
-        # TODO: put the squeeze in misr_utility?
         misr_util = tpal.misr_utility(
             misreports, jnp.squeeze(val_sample), tpal_state.params.auct
         )
         truth_util = tpal.utility(val_sample, alloc, pay)
         regret = misr_util - truth_util
 
-        print("utility truthful: " + str(jnp.sum(truth_util)))
-        print("utility misrep: " + str(jnp.sum(misr_util)))
-        print("regret: " + str(jnp.sum(regret)))
-        print("pay: " + str(jnp.sum(pay)))
+        # Accumulate values
+        total_truth_util += jnp.sum(truth_util)
+        total_misr_util += jnp.sum(misr_util)
+        total_regret += jnp.sum(regret)
+        total_pay += jnp.sum(pay)
+
+    # Compute averages
+    avg_truth_util = total_truth_util / num_samples
+    avg_misr_util = total_misr_util / num_samples
+    avg_regret = total_regret / num_samples
+    avg_pay = total_pay / num_samples
+
+    return avg_truth_util, avg_misr_util, avg_regret, avg_pay
 
 
-# Short training, for tests
-tpal, state = training(1000, 50, 500, 1000, 100, 5, 10, 200, 7)
-# Medium length training
-# tpal, state = training(50000, 50, 500, 1000, 100, 5, 10, 200, 7)
-# Long training
-# tpal, state = training(200000, 50, 1200, 50000, 100, 5, 10, 200, 7)
-# Full training, large batches, high # of misreport updates
-# tpal, state = training(200000, 100, 1200, 50000, 500, 5, 10, 200, 7)
+@ex.automain
+def run(_run, _config):
+    # Let's see what hardware we're working with. The training takes a few
+    # minutes on a GPU, a bit longer on CPU.
+    print("### Device information")
+    print(f"Number of devices: {jax.device_count()}")
+    print("Device:", jax.devices()[0].device_kind)
+    print("")
 
-print("Metrics of Two-Player Auction Learner")
-test(tpal, state)
+    # Logging Device Information
+    _run.log_scalar("devices.count", jax.device_count())
+    _run.log_scalar("device.kind", str(jax.devices()[0].device_kind))
+
+    # Training the auctioneer
+    print("### Starting training")
+    tpal, tpal_state = training()  # no need to pass parameters explicitly
+
+    # Serialize and save the TPAL model state
+    state_params_filename = "tpal_state_params.pkl"
+    joblib.dump(tpal_state.params, state_params_filename)
+
+    # Add the model and its state as artifacts to the Sacred run
+    ex.add_artifact(state_params_filename)
+
+    # Testing the auctioneer
+    num_samples = _config["num_test_samples"]
+    print("### Starting test")
+    avg_truth_util, avg_misr_util, avg_regret, avg_pay = test(
+        tpal, tpal_state, num_samples
+    )
+
+    print(f"### Average test results ({num_samples} samples)")
+    print(f"utility truthful: {avg_truth_util}")
+    print(f"utility misrep: {avg_misr_util}")
+    print(f"regret: {avg_regret}")
+    print(f"pay: {avg_pay}")
+
+    _run.log_scalar("utility_truthful", avg_truth_util)
+    _run.log_scalar("utility_misrep", avg_misr_util)
+    _run.log_scalar("regret", avg_regret)
+    _run.log_scalar("pay", avg_pay)

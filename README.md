@@ -7,19 +7,33 @@ This repository is a JAX/Haiku implementation of the paper ["Auction Learning as
 
 The [GAN example from dm-haiku](https://github.com/deepmind/dm-haiku/blob/4ae60fd4fd2da3b2f8f9ad3ec6dfd893745b483b/examples/mnist_gan.ipynb) was used as a starting point.
 
+
 ## Getting started
 
 ### Prerequisites
-- Install Python 3.7
-- [Install CUDA](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/index.html)
+- Install Python 3.7+
+- [Install CUDA](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/index.html) (optional)
 - follow the [instructions for installing JAX with CUDA support](https://github.com/google/jax#pip-installation-gpu-cuda)
 - clone this repository and `cd` into it
 - run `pip3 install -r requirements.txt`
 
-### Training models and showing metrics
-To training the model and print simple metrics run: `python3 algnet.py`
 
-You can find several settings at the bottom of the file, uncomment the one you want to train.
+## Usage
+
+To run the auction experiment with specific parameters:
+
+```
+  python algnet.py with num_steps=100 misr_updates=50 misr_reinit_iv=500 misr_reinit_lim=1000 batch_size=100 bidders=5 items=10 net_width=200 net_depth=7 num_test_samples=20
+```
+
+
+## Logging and Artifacts
+
+The project uses the [Sacred](https://github.com/IDSIA/sacred) framework for experiment tracking. 
+
+- Logs and experiment metadata are saved to an SQLite database named `results.db`.
+- The state parameters of the last trained model are saved to `tpal_state_params.pkl`.
+
 
 ## Implementation notes
 This module is kept simple to make it suitable for use with computational experiment frameworks, or as a component in larger systems.
