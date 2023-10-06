@@ -17,6 +17,8 @@
 # Based on https://github.com/deepmind/dm-haiku/blob/4ae60fd4fd2da3b2f8f9ad3ec6dfd893745b483b/examples/mnist_gan.ipynb
 
 import functools
+import os
+from datetime import datetime
 from typing import Any, NamedTuple
 
 import haiku as hk
@@ -495,10 +497,10 @@ def test(tpal, tpal_state, num_samples):
     rng = jax.random.PRNGKey(1337)
     sampler = BidSampler(rng, tpal.bidders, tpal.items)
 
-    total_truth_util = 0
-    total_misr_util = 0
-    total_regret = 0
-    total_pay = 0
+    truth_utils = []
+    misr_utils = []
+    regrets = []
+    pays = []
 
     for _ in range(num_samples):
         val_sample = sampler.sample(1)
@@ -515,19 +517,18 @@ def test(tpal, tpal_state, num_samples):
         truth_util = tpal.utility(val_sample, alloc, pay)
         regret = misr_util - truth_util
 
-        # Accumulate values
-        total_truth_util += jnp.sum(truth_util)
-        total_misr_util += jnp.sum(misr_util)
-        total_regret += jnp.sum(regret)
-        total_pay += jnp.sum(pay)
+        # Store results
+        truth_utils.append(truth_util)
+        misr_utils.append(misr_util)
+        regrets.append(regret)
+        pays.append(pay)
 
-    # Compute averages
-    avg_truth_util = total_truth_util / num_samples
-    avg_misr_util = total_misr_util / num_samples
-    avg_regret = total_regret / num_samples
-    avg_pay = total_pay / num_samples
-
-    return avg_truth_util, avg_misr_util, avg_regret, avg_pay
+    return {
+        "truth_util": jnp.stack(truth_utils),
+        "misr_util": jnp.stack(misr_utils),
+        "regret": jnp.stack(regrets),
+        "pay": jnp.stack(pays)
+    }
 
 
 @ex.automain
@@ -548,26 +549,34 @@ def run(_run, _config):
     tpal, tpal_state = training()  # no need to pass parameters explicitly
 
     # Serialize and save the TPAL model state
-    state_params_filename = "tpal_state_params.pkl"
+    if not os.path.exists("tpal_state_params"):
+        os.makedirs("tpal_state_params")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    state_params_filename = f"tpal_state_params/{timestamp}.pkl"
     joblib.dump(tpal_state.params, state_params_filename)
 
     # Add the model and its state as artifacts to the Sacred run
     ex.add_artifact(state_params_filename)
 
     # Testing the auctioneer
-    num_samples = _config["num_test_samples"]
     print("### Starting test")
-    avg_truth_util, avg_misr_util, avg_regret, avg_pay = test(
-        tpal, tpal_state, num_samples
-    )
+    num_samples = _config["num_test_samples"]
+    results = test(tpal, tpal_state, num_samples)
 
     print(f"### Average test results ({num_samples} samples)")
-    print(f"utility truthful: {avg_truth_util}")
-    print(f"utility misrep: {avg_misr_util}")
-    print(f"regret: {avg_regret}")
-    print(f"pay: {avg_pay}")
+    for key, matrix in results.items():
+        # Save the matrix to a temporary file
+        temp_filename = f"temp_{key}.pkl"
+        joblib.dump(matrix, temp_filename)
 
-    _run.log_scalar("utility_truthful", avg_truth_util)
-    _run.log_scalar("utility_misrep", avg_misr_util)
-    _run.log_scalar("regret", avg_regret)
-    _run.log_scalar("pay", avg_pay)
+        # Add the saved file as an artifact to the run
+        _run.add_artifact(temp_filename, name=key)
+
+        # Delete the temporary file after adding it to avoid clutter
+        os.remove(temp_filename)
+
+        # Log the averages
+        total_values = jnp.sum(matrix, axis=1)
+        average_total_value = jnp.mean(total_values)
+        _run.log_scalar(f"avg_{key}", average_total_value)
+        print(f"{key}: {average_total_value}")
