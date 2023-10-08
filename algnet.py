@@ -1,5 +1,6 @@
 # Copyright 2020 DeepMind Technologies Limited. All Rights Reserved.
 # Copyright 2021 Daniel Reusche
+# Copyright 2023 Tarek Sabet
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,6 +17,8 @@
 # Based on https://github.com/deepmind/dm-haiku/blob/4ae60fd4fd2da3b2f8f9ad3ec6dfd893745b483b/examples/mnist_gan.ipynb
 
 import functools
+import os
+from datetime import datetime
 from typing import Any, NamedTuple
 
 import haiku as hk
@@ -28,8 +31,37 @@ import jax.nn as nn
 
 from chex import assert_shape, assert_equal_shape
 
+import joblib
+
+from sacred import Experiment
+from sacred.observers import SqlObserver
+
+# Create a new experiment
+ex = Experiment("auction_experiment")
+
+# Attach an SQLite observer
+ex.observers.append(SqlObserver("sqlite:///results.db"))
+
+
+# Define configurations for the experiment
+@ex.config
+def cfg():
+    num_steps = 1000  # Default value, can be overwritten when running the script
+    num_test_samples = 10
+    misr_updates = 50
+    misr_reinit_iv = 500
+    misr_reinit_lim = 1000
+    batch_size = 100
+    bidders = 5
+    items = 10
+    net_width = 200
+    net_depth = 7
+    # val_dist = ...  # TODO: add when ready
+
+
 # Uncomment to disable asserts
 # chex.disable_asserts()
+
 
 # Model
 class BidSampler:
@@ -385,7 +417,9 @@ class TPAL:
 
 
 # Train a two player auction learner and return it with state.
+@ex.capture  # sacred experiment tracking decoration
 def training(
+    _run,  # for sacred logging
     num_steps,
     misr_updates,
     misr_reinit_iv,
@@ -400,12 +434,6 @@ def training(
     # @title {vertical-output: true}
 
     log_every = num_steps // 100
-
-    # Let's see what hardware we're working with. The training takes a few
-    # minutes on a GPU, a bit longer on CPU.
-    print(f"Number of devices: {jax.device_count()}")
-    print("Device:", jax.devices()[0].device_kind)
-    print("")
 
     # The model.
     tpal = TPAL(bidders, items, net_width, net_depth)
@@ -452,6 +480,11 @@ def training(
                 f"Step {step}: "
                 f"auct_loss = {auct_loss:.3f}, misr_loss = {misr_loss:.3f}"
             )
+
+            # Logging Losses
+            _run.log_scalar("losses.auct_loss", auct_loss, step)
+            _run.log_scalar("losses.misr_loss", misr_loss, step)
+
             steps.append(step)
             auct_losses.append(auct_loss)
             misr_losses.append(misr_loss)
@@ -459,11 +492,17 @@ def training(
     return tpal, tpal_state
 
 
-def test(tpal, tpal_state):
+# TODO vectorize and process all samples in parallel
+def test(tpal, tpal_state, num_samples):
     rng = jax.random.PRNGKey(1337)
     sampler = BidSampler(rng, tpal.bidders, tpal.items)
 
-    for _ in range(0, 10):
+    truth_utils = []
+    misr_utils = []
+    regrets = []
+    pays = []
+
+    for _ in range(num_samples):
         val_sample = sampler.sample(1)
 
         # Receive an auction
@@ -472,27 +511,72 @@ def test(tpal, tpal_state):
         # Receive misreports
         misreports = tpal.misr_transform.apply(tpal_state.params.misr, val_sample)
 
-        # TODO: put the squeeze in misr_utility?
         misr_util = tpal.misr_utility(
             misreports, jnp.squeeze(val_sample), tpal_state.params.auct
         )
         truth_util = tpal.utility(val_sample, alloc, pay)
         regret = misr_util - truth_util
 
-        print("utility truthful: " + str(jnp.sum(truth_util)))
-        print("utility misrep: " + str(jnp.sum(misr_util)))
-        print("regret: " + str(jnp.sum(regret)))
-        print("pay: " + str(jnp.sum(pay)))
+        # Store results
+        truth_utils.append(truth_util)
+        misr_utils.append(misr_util)
+        regrets.append(regret)
+        pays.append(pay)
+
+    return {
+        "truth_util": jnp.stack(truth_utils),
+        "misr_util": jnp.stack(misr_utils),
+        "regret": jnp.stack(regrets),
+        "pay": jnp.stack(pays)
+    }
 
 
-# Short training, for tests
-tpal, state = training(1000, 50, 500, 1000, 100, 5, 10, 200, 7)
-# Medium length training
-# tpal, state = training(50000, 50, 500, 1000, 100, 5, 10, 200, 7)
-# Long training
-# tpal, state = training(200000, 50, 1200, 50000, 100, 5, 10, 200, 7)
-# Full training, large batches, high # of misreport updates
-# tpal, state = training(200000, 100, 1200, 50000, 500, 5, 10, 200, 7)
+@ex.automain
+def run(_run, _config):
+    # Let's see what hardware we're working with. The training takes a few
+    # minutes on a GPU, a bit longer on CPU.
+    print("### Device information")
+    print(f"Number of devices: {jax.device_count()}")
+    print("Device:", jax.devices()[0].device_kind)
+    print("")
 
-print("Metrics of Two-Player Auction Learner")
-test(tpal, state)
+    # Logging Device Information
+    _run.log_scalar("devices.count", jax.device_count())
+    _run.log_scalar("device.kind", str(jax.devices()[0].device_kind))
+
+    # Training the auctioneer
+    print("### Starting training")
+    tpal, tpal_state = training()  # no need to pass parameters explicitly
+
+    # Serialize and save the TPAL model state
+    if not os.path.exists("tpal_state_params"):
+        os.makedirs("tpal_state_params")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    state_params_filename = f"tpal_state_params/{timestamp}.pkl"
+    joblib.dump(tpal_state.params, state_params_filename)
+
+    # Add the model and its state as artifacts to the Sacred run
+    ex.add_artifact(state_params_filename)
+
+    # Testing the auctioneer
+    print("### Starting test")
+    num_samples = _config["num_test_samples"]
+    results = test(tpal, tpal_state, num_samples)
+
+    print(f"### Average test results ({num_samples} samples)")
+    for key, matrix in results.items():
+        # Save the matrix to a temporary file
+        temp_filename = f"temp_{key}.pkl"
+        joblib.dump(matrix, temp_filename)
+
+        # Add the saved file as an artifact to the run
+        _run.add_artifact(temp_filename, name=key)
+
+        # Delete the temporary file after adding it to avoid clutter
+        os.remove(temp_filename)
+
+        # Log the averages
+        total_values = jnp.sum(matrix, axis=1)
+        average_total_value = jnp.mean(total_values)
+        _run.log_scalar(f"avg_{key}", average_total_value)
+        print(f"{key}: {average_total_value}")
