@@ -36,5 +36,10 @@ The project uses the [Sacred](https://github.com/IDSIA/sacred) framework for exp
 
 
 ## Implementation notes
+
 This module is kept simple to make it suitable for use with computational experiment frameworks, or as a component in larger systems.
 [Black](https://black.readthedocs.io/en/stable/) is used as a code formatter.
+
+## Funding
+
+This project is funded through the [NGI Assure Fund](https://nlnet.nl/assure), a fund established by [NLnet](https://nlnet.nl) with financial support from the European Commission's [Next Generation Internet](https://ngi.eu) program. Learn more on the [NLnet project page](https://nlnet.nl/project/dist-mech-learn).
