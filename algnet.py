@@ -43,6 +43,16 @@ ex = Experiment("auction_experiment")
 ex.observers.append(SqlObserver("sqlite:///results.db"))
 
 
+@ex.config
+def hyperparameter_ranges():
+    net_depth_options = [3, 7]
+    net_width_options = [50, 100, 200]
+    learning_rate_options = [0.0005, 0.001]
+    num_steps_options = [160000, 240000]
+    misr_reinit_iv_options = [800, 1600]
+    misr_reinit_lim_options = [40000, 60000]
+
+
 # Define configurations for the experiment
 @ex.config
 def cfg():
@@ -434,6 +444,7 @@ def training(
     items,
     net_width,
     net_depth,
+    learning_rate,
     # val_dist, TODO: add option to use different distributions
 ):
     # @title {vertical-output: true}
