@@ -43,16 +43,6 @@ ex = Experiment("auction_experiment")
 ex.observers.append(SqlObserver("sqlite:///results.db"))
 
 
-@ex.config
-def hyperparameter_ranges():
-    net_depth_options = [3, 7]
-    net_width_options = [50, 100, 200]
-    learning_rate_options = [0.0005, 0.001]
-    num_steps_options = [160000, 240000]
-    misr_reinit_iv_options = [800, 1600]
-    misr_reinit_lim_options = [40000, 60000]
-
-
 # Define configurations for the experiment
 @ex.config
 def cfg():
@@ -66,6 +56,7 @@ def cfg():
     items = 10
     net_width = 200
     net_depth = 7
+    learning_rate = 0.001
     # val_dist = ...  # TODO: add when ready
 
 
@@ -236,7 +227,7 @@ class TPALState(NamedTuple):
 class TPAL:
     """Two Player Auction Learner."""
 
-    def __init__(self, bidders, items, net_width, net_depth):
+    def __init__(self, bidders, items, net_width, net_depth, lr):
         self.bidders = bidders
         self.items = items
 
@@ -263,9 +254,8 @@ class TPAL:
 
         # Build the optimizers.
         self.optimizers = TPALTuple(
-            # try 1e-2/1e-3, b1, b2 are defaults
-            auct=optax.adamw(4e-4, b1=0.9, b2=0.999),
-            misr=optax.adamw(4e-4, b1=0.9, b2=0.999),
+            auct=optax.adamw(lr, b1=0.9, b2=0.999),
+            misr=optax.adamw(lr, b1=0.9, b2=0.999),
         )
 
     @functools.partial(jax.jit, static_argnums=0)
@@ -452,7 +442,7 @@ def training(
     log_every = num_steps // 100
 
     # The model.
-    tpal = TPAL(bidders, items, net_width, net_depth)
+    tpal = TPAL(bidders, items, net_width, net_depth, learning_rate)
 
     # Top-level RNG.
     rng = jax.random.PRNGKey(1729)
