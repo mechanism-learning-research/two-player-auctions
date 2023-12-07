@@ -74,8 +74,8 @@ def test_hyperparameters(config):
                     for misr_reinit_iv in hyperparameter_ranges["misr_reinit_iv"]:
                         for misr_reinit_lim in hyperparameter_ranges["misr_reinit_lim"]:
                             for i in range(5):
-                                seed_train = rng_seeds["training"][i+1]
-                                seed_test  = rng_seeds["test"][i+1]
+                                seed_train = rng_seeds["training"][i]
+                                seed_test  = rng_seeds["test"][i]
                                 run_algnet_with_config(
                                    config,
                                    num_steps,
@@ -89,5 +89,32 @@ def test_hyperparameters(config):
                                    seed_train,
                                    seed_test
                                )
+def test_chosen(config, choice_indices, training_seeds, test_seeds):
+    n = len(training_seeds)
+    assert(n==len(test_seeds))
+    for i in range(n):
+        num_steps       = hyperparameter_ranges["num_steps"      ][choice_indices[0]]
+        net_depth       = hyperparameter_ranges["net_depth"      ][choice_indices[1]]
+        net_width       = hyperparameter_ranges["net_width"      ][choice_indices[2]]
+        lr              = hyperparameter_ranges["learning_rate"  ][choice_indices[3]]
+        misr_reinit_iv  = hyperparameter_ranges["misr_reinit_iv" ][choice_indices[4]]
+        misr_reinit_lim = hyperparameter_ranges["misr_reinit_lim"][choice_indices[5]]
 
-test_hyperparameters("1x2")
+        seed_train = training_seeds[i]
+        seed_test  = test_seeds[i]
+
+        run_algnet_with_config(
+            config,
+            num_steps,
+            100, # misr_updates
+            misr_reinit_iv,
+            misr_reinit_lim,
+            net_depth,
+            net_width,
+            10000, # num_test_samples
+            lr,
+            seed_train,
+            seed_test
+        )
+
+test_chosen("1x2", [0,0,0,0,0,0,0], rng_seeds["training"], rng_seeds["test"])
