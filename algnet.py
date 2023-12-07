@@ -57,6 +57,8 @@ def cfg():
     net_width = 200
     net_depth = 7
     learning_rate = 0.001
+    rng_seed_training = 1729
+    rng_seed_test = 1337
     # val_dist = ...  # TODO: add when ready
 
 
@@ -435,6 +437,7 @@ def training(
     net_width,
     net_depth,
     learning_rate,
+    rng_seed_training
     # val_dist, TODO: add option to use different distributions
 ):
     # @title {vertical-output: true}
@@ -445,7 +448,7 @@ def training(
     tpal = TPAL(bidders, items, net_width, net_depth, learning_rate)
 
     # Top-level RNG.
-    rng = jax.random.PRNGKey(1729)
+    rng = jax.random.PRNGKey(rng_seed_training)
 
     # Initialize the network and optimizer.
     rng, rng_sampler, rng_state_init, rng_misr_reinit = jax.random.split(rng, 4)
@@ -499,8 +502,8 @@ def training(
 
 
 # TODO vectorize and process all samples in parallel
-def test(tpal, tpal_state, num_samples):
-    rng = jax.random.PRNGKey(1337)
+def test(tpal, tpal_state, num_samples, rng_seed_test):
+    rng = jax.random.PRNGKey(rng_seed_test)
     sampler = BidSampler(rng, tpal.bidders, tpal.items)
 
     truth_utils = []
@@ -549,6 +552,8 @@ def run(_run, _config):
     # Logging Device Information
     _run.log_scalar("devices.count", jax.device_count())
     _run.log_scalar("device.kind", str(jax.devices()[0].device_kind))
+    _run.log_scalar("rng.seed.training", _config["rng_seed_training"])
+    _run.log_scalar("rng.seed.test", _config["rng_seed_test"])
 
     # Training the auctioneer
     print("### Starting training")
@@ -567,7 +572,7 @@ def run(_run, _config):
     # Testing the auctioneer
     print("### Starting test")
     num_samples = _config["num_test_samples"]
-    results = test(tpal, tpal_state, num_samples)
+    results = test(tpal, tpal_state, num_samples, _config["rng_seed_test"])
 
     print(f"### Average test results ({num_samples} samples)")
     for key, matrix in results.items():
