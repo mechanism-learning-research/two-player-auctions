@@ -98,6 +98,17 @@ def permute_along_bidders(B, i):
     assert_equal_shape([B, permuted])
     return permuted
 
+def batched_permutations(vals):
+    num_bidders = vals.shape[1]
+    # Expand vals to create a 3D tensor: shape [bidders, bidders, valuations]
+    # Permute each slice
+    permuted_vals = jnp.array([jnp.concatenate([vals[:, i:i+1], vals[:, :i], vals[:, i+1:]], axis=1) for i in range(num_bidders)])
+
+    # Flatten the permuted slices
+    flattened_permuted_vals = jnp.reshape(permuted_vals, (num_bidders, -1))
+
+    return flattened_permuted_vals
+
 
 class Auctioneer(hk.Module):
     """Auctioneer network."""
@@ -121,6 +132,10 @@ class Auctioneer(hk.Module):
     def __call__(self, vals):
         """Computes auctions, consisting of an allocation and a payment matrix."""
 
+        # TODO HOTFIX: add batch dimension to vals
+        if vals.ndim == 2:
+            vals = vals[None, ...]
+
         # rows are bidders
         # columns are items
 
@@ -129,15 +144,8 @@ class Auctioneer(hk.Module):
         alloc = nn.sigmoid(alloc)
         assert_shape(alloc, (self.items,))
 
-        # probability to allocate item j to bidder i
-        L = jnp.stack(  # stack bidder vectors to get matrix
-            # compute bidder vectors
-            [
-                self.alloc_which(jnp.ravel(permute_along_bidders(vals, i)))
-                for i in range(self.bidders)
-            ],
-            axis=0,
-        )
+        # probabiliy to allocate item j to bidder i, conditioned on j being allocated
+        L = jax.vmap(self.alloc_which)(batched_permutations(vals))
 
         # softmax to ensure feasibility (allocate every item at most once).
         L = nn.softmax(L, axis=0)
@@ -146,16 +154,8 @@ class Auctioneer(hk.Module):
         alloc = alloc * L
         assert_shape(alloc, (self.bidders, self.items))
 
-        # fraction of utility each bidder pays to the mechanism
-        pay = jnp.squeeze(
-            jnp.stack(
-                [
-                    nn.sigmoid(self.pay_mlp(jnp.ravel(permute_along_bidders(vals, i))))
-                    for i in range(self.bidders)
-                ],
-                axis=1,
-            )
-        )
+        sigmoided_pay = lambda x: nn.sigmoid(self.pay_mlp(jnp.ravel(x)))
+        pay = jnp.squeeze( jax.vmap(sigmoided_pay)(batched_permutations(vals)) )
 
         # Fix shape for single bidder case.
         if self.bidders == 1:
@@ -195,13 +195,13 @@ class Misreporter(hk.Module):
     def __call__(self, vals):
         """Computes (approximately) optimal misreports for a given auction."""
 
-        # TODO: JAXize more?
-        m_ = []
-        for i in range(self.bidders):
-            misr = self.misr_mlp(jnp.ravel(permute_along_bidders(vals, i)))
-            m_.append(misr)
+        # TODO HOTFIX: add batch dimension to vals
+        if vals.ndim == 2:
+            vals = vals[None, ...]
 
-        misreports = jnp.stack(m_)
+        misr = lambda x: self.misr_mlp(jnp.ravel(x))
+        misreports = jax.vmap(misr)(batched_permutations(vals))
+
         assert_shape(misreports, (self.bidders, self.items))
 
         # NOTE: sigmoid for [0,1] valuations, should be e.g. softplus for positive valuations
