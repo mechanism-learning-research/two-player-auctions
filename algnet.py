@@ -305,42 +305,29 @@ class TPAL:
         assert_equal_shape([utilities, pay])
         return utilities
 
-    # check of utility[i] == utility_i
-    def utility_i(self, vals, i, alloc, pay):
-        return jnp.sum(alloc[i] * vals[i]) - pay[i]
-
-    # Take misreports of bidder i while keeping the rest fixed
-    def misr_bidder_i(self, vals, misrs, i):
-    # In case of a single bidder, return the misreports directly
-        if self.bidders == 1:
-            return misrs
-
-        # Create a boolean mask for the ith column
-        mask = jnp.array([index == i for index in range(vals.shape[1])])
-
-        # Select misreports for the ith bidder and original values for others
-        V_minus_i = jnp.where(mask, misrs[:, i:i + 1], vals)
-
-        return V_minus_i
-
     def misr_utility(self, misreports, val_sample, auct_params):
-        # TODO: JAXize more?
-        misr_utils = []
-        for i in range(0, self.bidders):
-            misr_i = self.misr_bidder_i(val_sample, misreports, i)
-            assert_shape(misr_i, (self.bidders, self.items))
+        # Handle the single bidder case separately
+        if self.bidders == 1:
+            return misreports
 
-            # Receive an auction for misr_i
-            alloc_m, pay_m = self.auct_transform.apply(auct_params, misr_i)
+        # Vectorized computation for each bidder
+        def vectorized_misr_bidder_i(i):
+            mask = jnp.arange(val_sample.shape[1]) == i
+            # Use lax.dynamic_slice for dynamic indexing
+            misr_i = jax.lax.dynamic_slice(misreports, (0, i), (misreports.shape[0], 1))
+            V_minus_i = jnp.where(mask, misr_i, val_sample)
+            return V_minus_i
 
-            u_i = self.utility(val_sample, alloc_m, pay_m)
-            u_i = u_i[i]
-            assert_shape(u_i, ())
+        misr_i_all = jax.vmap(vectorized_misr_bidder_i)(jnp.arange(self.bidders))
 
-            misr_utils.append(u_i)
+        # Vectorized auction transform
+        alloc_m_all, pay_m_all = jax.vmap(lambda misr_i: self.auct_transform.apply(auct_params, misr_i))(misr_i_all)
 
-        u_misr = jnp.stack(misr_utils)
-        return u_misr
+        # Vectorized utility computation
+        u_func = jax.vmap(lambda alloc_m, pay_m, i: self.utility(val_sample, alloc_m, pay_m)[i], in_axes=(0, 0, 0))
+        u_all = u_func(alloc_m_all, pay_m_all, jnp.arange(self.bidders))
+
+        return u_all
 
     def auct_loss(self, auct_params, misr_params, val_sample):
         """Auctioneer loss."""
