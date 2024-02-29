@@ -87,6 +87,9 @@ class BidSampler:
 # move b_i to the front of B
 # B = [b_i, b_0, ..., b_i-1, b_i+1, ..., b_n]
 def permute_along_bidders(B, i):
+    if B.ndim == 1:
+        return B
+
     head = B[:, 0:i]  # all bid profiles up to b_i
     tail = B[:, i + 1 :]  # all bid profiles after b_i
     b_i = B[:, i : i + 1]  # b_i, slice this way to preserve shape
@@ -308,14 +311,16 @@ class TPAL:
 
     # Take misreports of bidder i while keeping the rest fixed
     def misr_bidder_i(self, vals, misrs, i):
-        head = vals[:, 0:i]  # all bid profiles up to V_i
-        tail = vals[:, i + 1 :]  # all bid profiles after V_i
-        m_i = misrs[
-            :, i : i + 1
-        ]  # misreports of bidder i, slice this way to preserve shape
-        V_minus_i = jnp.concatenate([head, m_i, tail], axis=1)
+    # In case of a single bidder, return the misreports directly
+        if self.bidders == 1:
+            return misrs
 
-        assert_equal_shape([vals, V_minus_i])
+        # Create a boolean mask for the ith column
+        mask = jnp.array([index == i for index in range(vals.shape[1])])
+
+        # Select misreports for the ith bidder and original values for others
+        V_minus_i = jnp.where(mask, misrs[:, i:i + 1], vals)
+
         return V_minus_i
 
     def misr_utility(self, misreports, val_sample, auct_params):
