@@ -313,7 +313,7 @@ class TPAL:
 
     # Take misreports of bidder i while keeping the rest fixed
     def misr_bidder_i(self, vals, misrs, i):
-    # In case of a single bidder, return the misreports directly
+        # In case of a single bidder, return the misreports directly
         if self.bidders == 1:
             return misrs
 
@@ -321,7 +321,7 @@ class TPAL:
         mask = jnp.array([index == i for index in range(vals.shape[1])])
 
         # Select misreports for the ith bidder and original values for others
-        V_minus_i = jnp.where(mask, misrs[:, i:i + 1], vals)
+        V_minus_i = jnp.where(mask, misrs[:, i : i + 1], vals)
 
         return V_minus_i
 
@@ -524,7 +524,10 @@ def test(tpal, tpal_state, num_samples, rng_seed_test):
             misreports, jnp.squeeze(val_sample), tpal_state.params.auct
         )
         truth_util = tpal.utility(val_sample, alloc, pay)
-        regret = misr_util - truth_util
+
+        # check if this value is too negative, to see whether misreporter didn't converge
+        # raw_regret = misr_util - truth_util
+        regret = nn.relu(misr_util - truth_util)
 
         # Store results
         truth_utils.append(truth_util)
@@ -536,7 +539,7 @@ def test(tpal, tpal_state, num_samples, rng_seed_test):
         "truth_util": jnp.stack(truth_utils),
         "misr_util": jnp.stack(misr_utils),
         "regret": jnp.stack(regrets),
-        "pay": jnp.stack(pays)
+        "pay": jnp.stack(pays),
     }
 
 
