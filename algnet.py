@@ -56,6 +56,9 @@ def cfg():
     items = 10
     net_width = 200
     net_depth = 7
+    learning_rate = 0.001
+    rng_seed_training = 1729
+    rng_seed_test = 1337
     # val_dist = ...  # TODO: add when ready
 
 
@@ -226,7 +229,7 @@ class TPALState(NamedTuple):
 class TPAL:
     """Two Player Auction Learner."""
 
-    def __init__(self, bidders, items, net_width, net_depth):
+    def __init__(self, bidders, items, net_width, net_depth, lr):
         self.bidders = bidders
         self.items = items
 
@@ -253,9 +256,8 @@ class TPAL:
 
         # Build the optimizers.
         self.optimizers = TPALTuple(
-            # try 1e-2/1e-3, b1, b2 are defaults
-            auct=optax.adamw(4e-4, b1=0.9, b2=0.999),
-            misr=optax.adamw(4e-4, b1=0.9, b2=0.999),
+            auct=optax.adamw(lr, b1=0.9, b2=0.999),
+            misr=optax.adamw(lr, b1=0.9, b2=0.999),
         )
 
     @functools.partial(jax.jit, static_argnums=0)
@@ -311,7 +313,7 @@ class TPAL:
 
     # Take misreports of bidder i while keeping the rest fixed
     def misr_bidder_i(self, vals, misrs, i):
-    # In case of a single bidder, return the misreports directly
+        # In case of a single bidder, return the misreports directly
         if self.bidders == 1:
             return misrs
 
@@ -319,7 +321,7 @@ class TPAL:
         mask = jnp.array([index == i for index in range(vals.shape[1])])
 
         # Select misreports for the ith bidder and original values for others
-        V_minus_i = jnp.where(mask, misrs[:, i:i + 1], vals)
+        V_minus_i = jnp.where(mask, misrs[:, i : i + 1], vals)
 
         return V_minus_i
 
@@ -434,6 +436,8 @@ def training(
     items,
     net_width,
     net_depth,
+    learning_rate,
+    rng_seed_training
     # val_dist, TODO: add option to use different distributions
 ):
     # @title {vertical-output: true}
@@ -441,10 +445,10 @@ def training(
     log_every = num_steps // 100
 
     # The model.
-    tpal = TPAL(bidders, items, net_width, net_depth)
+    tpal = TPAL(bidders, items, net_width, net_depth, learning_rate)
 
     # Top-level RNG.
-    rng = jax.random.PRNGKey(1729)
+    rng = jax.random.PRNGKey(rng_seed_training)
 
     # Initialize the network and optimizer.
     rng, rng_sampler, rng_state_init, rng_misr_reinit = jax.random.split(rng, 4)
@@ -498,8 +502,8 @@ def training(
 
 
 # TODO vectorize and process all samples in parallel
-def test(tpal, tpal_state, num_samples):
-    rng = jax.random.PRNGKey(1337)
+def test(tpal, tpal_state, num_samples, rng_seed_test):
+    rng = jax.random.PRNGKey(rng_seed_test)
     sampler = BidSampler(rng, tpal.bidders, tpal.items)
 
     truth_utils = []
@@ -520,7 +524,10 @@ def test(tpal, tpal_state, num_samples):
             misreports, jnp.squeeze(val_sample), tpal_state.params.auct
         )
         truth_util = tpal.utility(val_sample, alloc, pay)
-        regret = misr_util - truth_util
+
+        # check if this value is too negative, to see whether misreporter didn't converge
+        # raw_regret = misr_util - truth_util
+        regret = nn.relu(misr_util - truth_util)
 
         # Store results
         truth_utils.append(truth_util)
@@ -532,7 +539,7 @@ def test(tpal, tpal_state, num_samples):
         "truth_util": jnp.stack(truth_utils),
         "misr_util": jnp.stack(misr_utils),
         "regret": jnp.stack(regrets),
-        "pay": jnp.stack(pays)
+        "pay": jnp.stack(pays),
     }
 
 
@@ -548,6 +555,8 @@ def run(_run, _config):
     # Logging Device Information
     _run.log_scalar("devices.count", jax.device_count())
     _run.log_scalar("device.kind", str(jax.devices()[0].device_kind))
+    _run.log_scalar("rng.seed.training", _config["rng_seed_training"])
+    _run.log_scalar("rng.seed.test", _config["rng_seed_test"])
 
     # Training the auctioneer
     print("### Starting training")
@@ -566,7 +575,7 @@ def run(_run, _config):
     # Testing the auctioneer
     print("### Starting test")
     num_samples = _config["num_test_samples"]
-    results = test(tpal, tpal_state, num_samples)
+    results = test(tpal, tpal_state, num_samples, _config["rng_seed_test"])
 
     print(f"### Average test results ({num_samples} samples)")
     for key, matrix in results.items():

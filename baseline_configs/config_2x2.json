@@ -1,0 +1,15 @@
+{
+    "num_test_samples": 10000,
+    "batch_size": 500,
+    "misr_updates": 100,
+    "bidders": 2,
+    "items": 2,
+    "num_steps": 240000,
+    "misr_reinit_iv": 800,
+    "misr_reinit_lim": 40000,
+    "net_width": 100,
+    "net_depth": 7,
+    "learning_rate": 0.001,
+    "rng_seed_training": 1529,
+    "rng_seed_test": 6266
+}
