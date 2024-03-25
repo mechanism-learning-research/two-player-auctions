@@ -59,6 +59,9 @@ def cfg():
     learning_rate = 0.001
     rng_seed_training = 1729
     rng_seed_test = 1337
+    misreport_type = 'uniform'  # Can be 'uniform' or 'normal'
+    misreport_params = {'low': 0., 'high': 1.}  # Example for uniform distribution
+    attack_mode = 'offline'  # Can be 'online' or 'offline'
     # val_dist = ...  # TODO: add when ready
 
 
@@ -86,6 +89,40 @@ class BidSampler:
         )
         return sample
 
+class ValuationMisreporter:
+    def __init__(self, rng, bidders, items, misreport_type='uniform', misreport_params=None):
+        self.bidders = bidders
+        self.items = items
+        self.key = rng
+        self.misreport_type = misreport_type
+        self.misreport_params = misreport_params if misreport_params is not None else {}
+
+    def sample(self, num_samples):
+        self.key, subkey = jax.random.split(self.key)
+        samples = []
+
+        for _ in range(num_samples):
+            # Sample for all bidders from the truthful distribution
+            truthful_sample = jax.random.uniform(subkey, (self.bidders, self.items))
+
+            # Modify the sample for the first bidder (assumed misreporting)
+            if self.misreport_type == 'uniform':
+                low = self.misreport_params.get('low', 0)
+                high = self.misreport_params.get('high', 1)
+                misreport_sample = jax.random.uniform(subkey, (1, self.items), minval=low, maxval=high)
+            elif self.misreport_type == 'normal':
+                mean = self.misreport_params.get('mean', 0)
+                stddev = self.misreport_params.get('stddev', 1)
+                misreport_sample = jax.random.normal(subkey, (1, self.items)) * stddev + mean
+            else:
+                raise ValueError(f"Unsupported misreport type: {self.misreport_type}")
+
+            # Replace the truthful sample for the first bidder with the misreported sample
+            modified_sample = jnp.concatenate([misreport_sample, truthful_sample[1:]], axis=0)
+
+            samples.append(modified_sample)
+
+        return jnp.stack(samples, axis=0)
 
 # move b_i to the front of B
 # B = [b_i, b_0, ..., b_i-1, b_i+1, ..., b_n]
@@ -437,7 +474,10 @@ def training(
     net_width,
     net_depth,
     learning_rate,
-    rng_seed_training
+    rng_seed_training,
+    misreport_type,
+    misreport_params,
+    attack_mode  # Added attack mode to the training function parameters TODO: use this
     # val_dist, TODO: add option to use different distributions
 ):
     # @title {vertical-output: true}
@@ -453,22 +493,22 @@ def training(
     # Initialize the network and optimizer.
     rng, rng_sampler, rng_state_init, rng_misr_reinit = jax.random.split(rng, 4)
 
-    # Initialize BidSampler
-    sampler = BidSampler(rng_sampler, bidders, items)
+    # Initialize ValuationMisreporter for offline attack scenario
+    valuation_misreporter = ValuationMisreporter(rng_sampler, bidders, items, misreport_type=misreport_type, misreport_params=misreport_params)
 
-    tpal_state = tpal.initial_state(rng_state_init, sampler.sample(1))
+    tpal_state = tpal.initial_state(rng_state_init, valuation_misreporter.sample(1))
 
     steps = []
     auct_losses = []
     misr_losses = []
 
     for step in range(num_steps):
-        # Sample valuations
-        val_sample = sampler.sample(batch_size)
+        # Sample valuations using ValuationMisreporter
+        val_sample = valuation_misreporter.sample(batch_size)
 
         if ((step % misr_reinit_iv) == 0) and (step <= misr_reinit_lim):
             tpal_state = tpal.reinit_misr(
-                rng_misr_reinit, tpal_state, sampler.sample(1)
+                rng_misr_reinit, tpal_state, valuation_misreporter.sample(1)
             )
 
         for _ in range(0, misr_updates):
@@ -557,6 +597,18 @@ def run(_run, _config):
     _run.log_scalar("device.kind", str(jax.devices()[0].device_kind))
     _run.log_scalar("rng.seed.training", _config["rng_seed_training"])
     _run.log_scalar("rng.seed.test", _config["rng_seed_test"])
+
+    # Logging Misreport Settings
+    print("### Misreport Settings")
+    print(f"Misreport Type: {_config['misreport_type']}")
+    print(f"Misreport Parameters: {_config['misreport_params']}")
+    print(f"Attack Mode: {_config['attack_mode']}")
+
+    # Logging Misreport Settings
+    _run.log_scalar("misreport.type", _config["misreport_type"])
+    for param, value in _config["misreport_params"].items():
+        _run.log_scalar(f"misreport.params.{param}", value)
+    _run.log_scalar("attackmode", _config["attack_mode"])
 
     # Training the auctioneer
     print("### Starting training")
