@@ -54,8 +54,8 @@ def cfg():
     batch_size = 100
     bidders = 5
     items = 10
-    net_width = 200
-    net_depth = 7
+    hidden_width = 200
+    n_hidden = 7
     learning_rate = 0.001
     rng_seed_training = 1729
     rng_seed_test = 1337
@@ -105,21 +105,26 @@ def permute_along_bidders(B, i):
 class Auctioneer(hk.Module):
     """Auctioneer network."""
 
-    def __init__(self, bidders, items, net_width, net_depth, name=None):
+    def __init__(self, bidders, items, hidden_width, n_hidden, name=None):
         super().__init__(name=name)
         self.bidders = bidders
         self.items = items
-        self.net_width = net_width  # TODO: unify this between auct and misr?
-        self.net_depth = net_depth
+        self.hidden_width = hidden_width
+        self.n_hidden = n_hidden
 
-        self.layers = [self.bidders * self.items, self.net_width, self.net_depth]
-        self.layers_alloc = [*self.layers, self.items]
-        self.layers_pay = [*self.layers, 1]
+
+        input_width = self.bidders * self.items
+        hidden_layers = [self.hidden_width] * self.n_hidden
+        
+        # Layers for allocation MLPs
+        alloc_layers = [input_width, *hidden_layers, self.items]
+        # Layers for payment MLP
+        pay_layers = [input_width, *hidden_layers, 1]
 
         # Initialize MLPs
-        self.alloc_prob = MLP(self.layers_alloc, activation=jnp.tanh)
-        self.alloc_which = MLP(self.layers_alloc, activation=jnp.tanh)
-        self.pay_mlp = MLP(self.layers_pay, activation=jnp.tanh)
+        self.alloc_prob = MLP(alloc_layers, activation=jnp.tanh)
+        self.alloc_which = MLP(alloc_layers, activation=jnp.tanh)
+        self.pay_mlp = MLP(pay_layers, activation=jnp.tanh)
 
     def __call__(self, vals):
         """Computes auctions, consisting of an allocation and a payment matrix."""
@@ -178,22 +183,20 @@ class Auctioneer(hk.Module):
 class Misreporter(hk.Module):
     """Misreporter network."""
 
-    def __init__(self, bidders, items, net_width, net_depth, name=None):
+    def __init__(self, bidders, items, hidden_width, n_hidden, name=None):
         super().__init__(name=name)
         self.bidders = bidders
         self.items = items
-        self.net_width = net_width
-        self.net_depth = net_depth
+        self.hidden_width = hidden_width
+        self.n_hidden = n_hidden
 
-        self.layers = [
-            self.bidders * self.items,
-            self.net_width,
-            self.net_depth,
-            self.items,
-        ]
+        # Layers for misreporter MLP
+        input_width = self.bidders * self.items
+        hidden_layers = [self.hidden_width] * self.n_hidden
+        misr_layers = [input_width,  *hidden_layers, self.items]
 
         # Initialize MLP
-        self.misr_mlp = MLP(self.layers, activation=jnp.tanh)
+        self.misr_mlp = MLP(misr_layers, activation=jnp.tanh)
 
     def __call__(self, vals):
         """Computes (approximately) optimal misreports for a given auction."""
@@ -229,19 +232,19 @@ class TPALState(NamedTuple):
 class TPAL:
     """Two Player Auction Learner."""
 
-    def __init__(self, bidders, items, net_width, net_depth, lr):
+    def __init__(self, bidders, items, hidden_width, n_hidden, lr):
         self.bidders = bidders
         self.items = items
 
-        self.net_width = net_width
-        self.net_depth = net_depth
+        self.hidden_width = hidden_width
+        self.n_hidden = n_hidden
 
         # Define the Haiku network transforms.
         # We don't use BatchNorm so we don't use `with_state`.
         self.auct_transform = hk.without_apply_rng(
             hk.transform(
                 lambda *args: Auctioneer(
-                    self.bidders, self.items, self.net_width, self.net_depth
+                    self.bidders, self.items, self.hidden_width, self.n_hidden
                 )(*args)
             )
         )
@@ -249,7 +252,7 @@ class TPAL:
         self.misr_transform = hk.without_apply_rng(
             hk.transform(
                 lambda *args: Misreporter(
-                    self.bidders, self.items, self.net_width, self.net_depth
+                    self.bidders, self.items, self.hidden_width, self.n_hidden
                 )(*args)
             )
         )
@@ -271,8 +274,15 @@ class TPAL:
             misr=self.misr_transform.init(rng_misr, vals),
         )
 
-        print("Auctioneer: \n\n{}\n".format(tree_shape(params.auct)))
-        print("Misreporter: \n\n{}\n".format(tree_shape(params.misr)))
+        def print_layers(params):
+            for key, value in params.items():
+                print(f"{key}:\tb = {value['b']}\tw = {value['w']}")
+
+        print("Auctioneer:")
+        print_layers(tree_shape(params.auct))
+
+        print("\nMisreporter:")
+        print_layers(tree_shape(params.misr))
 
         # Initialize the optimizers.
         opt_state = TPALTuple(
@@ -434,8 +444,8 @@ def training(
     batch_size,
     bidders,
     items,
-    net_width,
-    net_depth,
+    hidden_width,
+    n_hidden,
     learning_rate,
     rng_seed_training
     # val_dist, TODO: add option to use different distributions
@@ -445,7 +455,7 @@ def training(
     log_every = num_steps // 100
 
     # The model.
-    tpal = TPAL(bidders, items, net_width, net_depth, learning_rate)
+    tpal = TPAL(bidders, items, hidden_width, n_hidden, learning_rate)
 
     # Top-level RNG.
     rng = jax.random.PRNGKey(rng_seed_training)
