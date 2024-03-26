@@ -7,8 +7,8 @@
     "num_steps": 160000,
     "misr_reinit_iv": 800,
     "misr_reinit_lim": 40000,
-    "net_width": 50,
-    "net_depth": 7,
+    "hidden_width": 50,
+    "n_hidden": 3,
     "learning_rate": 0.001,
     "rng_seed_training": 1529,
     "rng_seed_test": 6266
