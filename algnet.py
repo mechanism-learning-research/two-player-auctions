@@ -89,7 +89,7 @@ class BidSampler:
         )
         return sample
 
-class ValuationMisreporter:
+class ValuationMisreporterOffline:
     def __init__(self, rng, bidders, items, misreport_type='uniform', misreport_params=None):
         self.bidders = bidders
         self.items = items
@@ -97,15 +97,12 @@ class ValuationMisreporter:
         self.misreport_type = misreport_type
         self.misreport_params = misreport_params if misreport_params is not None else {}
 
-    def sample(self, num_samples):
+    def misreport(self, val_samples):
         self.key, subkey = jax.random.split(self.key)
-        samples = []
+        modified_samples = []
 
-        for _ in range(num_samples):
-            # Sample for all bidders from the truthful distribution
-            truthful_sample = jax.random.uniform(subkey, (self.bidders, self.items))
-
-            # Modify the sample for the first bidder (assumed misreporting)
+        for val_sample in val_samples:
+            # Sample for the first bidder (assumed misreporting)
             if self.misreport_type == 'uniform':
                 low = self.misreport_params.get('low', 0)
                 high = self.misreport_params.get('high', 1)
@@ -118,11 +115,37 @@ class ValuationMisreporter:
                 raise ValueError(f"Unsupported misreport type: {self.misreport_type}")
 
             # Replace the truthful sample for the first bidder with the misreported sample
-            modified_sample = jnp.concatenate([misreport_sample, truthful_sample[1:]], axis=0)
+            modified_sample = jnp.concatenate([misreport_sample, val_sample[1:]], axis=0)
+            modified_samples.append(modified_sample)
 
+        return jnp.stack(modified_samples, axis=0)
+
+class ValuationMisreporterOnline(hk.Module):
+    """Online Misreporter network using an MLP for generating misreports."""
+    def __init__(self, rng, bidders, items, net_width, net_depth, name=None):
+        super().__init__(name=name)
+        self.bidders = bidders
+        self.items = items
+        self.net_width = net_width
+        self.net_depth = net_depth
+        self.key = rng
+        self.mlp = MLP([self.bidders * self.items, self.net_width, self.net_depth, self.items], activation=jnp.tanh)
+
+    def __call__(self, true_vals):
+        misreports = self.mlp(jnp.ravel(true_vals))
+        misreports = nn.sigmoid(misreports) # Assuming valuations are in [0,1]
+        return misreports
+
+    def sample(self, num_samples):
+        samples = []
+        for _ in range(num_samples):
+            self.key, subkey = jax.random.split(self.key)
+            true_vals = jax.random.uniform(subkey, (self.bidders, self.items))
+            misreport = self(true_vals[0])
+            modified_sample = jnp.concatenate([misreport[None, :], true_vals[1:]], axis=0)
             samples.append(modified_sample)
-
         return jnp.stack(samples, axis=0)
+
 
 # move b_i to the front of B
 # B = [b_i, b_0, ..., b_i-1, b_i+1, ..., b_n]
@@ -475,9 +498,8 @@ def training(
     net_depth,
     learning_rate,
     rng_seed_training,
-    misreport_type,
-    misreport_params,
-    attack_mode  # Added attack mode to the training function parameters TODO: use this
+    bid_sampler, # BidSampler, ValuationMisreporterOffline or ValuationMisreporterOnline
+    attack_mode
     # val_dist, TODO: add option to use different distributions
 ):
     # @title {vertical-output: true}
@@ -493,28 +515,34 @@ def training(
     # Initialize the network and optimizer.
     rng, rng_sampler, rng_state_init, rng_misr_reinit = jax.random.split(rng, 4)
 
-    # Initialize ValuationMisreporter for offline attack scenario
-    valuation_misreporter = ValuationMisreporter(rng_sampler, bidders, items, misreport_type=misreport_type, misreport_params=misreport_params)
-
-    tpal_state = tpal.initial_state(rng_state_init, valuation_misreporter.sample(1))
+    tpal_state = tpal.initial_state(rng_state_init, bid_sampler.sample(1)[0])
 
     steps = []
     auct_losses = []
     misr_losses = []
 
     for step in range(num_steps):
-        # Sample valuations using ValuationMisreporter
-        val_sample = valuation_misreporter.sample(batch_size)
+        # Sample valuations using bid_sampler
+        val_sample, true_val_first_bidder = bid_sampler.sample(batch_size)
 
         if ((step % misr_reinit_iv) == 0) and (step <= misr_reinit_lim):
             tpal_state = tpal.reinit_misr(
-                rng_misr_reinit, tpal_state, valuation_misreporter.sample(1)
+                rng_misr_reinit, tpal_state, bid_sampler.sample(1)[0]
             )
 
         for _ in range(0, misr_updates):
             tpal_state, misr_log = tpal.update_misr(tpal_state, val_sample)
 
         tpal_state, auct_log = tpal.update_auct(tpal_state, val_sample)
+
+        if attack_mode == 'online':
+            # Receive an auction
+            auct_params = tpal_state.params.auct
+            alloc, pay = self.auct_transform.apply(auct_params, val_sample)
+            # Calculate utility for first bidder
+            utility_first_bidder = jnp.sum(alloc[0] * true_val_first_bidder) - pay[0]
+            # Update the online misreporter model
+            bid_sampler.update(utility_first_bidder)
 
         # Log the losses.
         if step % log_every == 0:
@@ -612,7 +640,8 @@ def run(_run, _config):
 
     # Training the auctioneer
     print("### Starting training")
-    tpal, tpal_state = training()  # no need to pass parameters explicitly
+    bid_sampler = ValuationMisreporterOffline if _config["attack_mode"] == "offline" else ValuationMisreporterOnline
+    tpal, tpal_state = training(bid_sampler=bid_sampler(_config["rng_seed_training"], _config["bidders"], _config["items"], _config["net_width"], _config["net_depth"]))  # no need to pass parameters explicitly
 
     # Serialize and save the TPAL model state
     if not os.path.exists("tpal_state_params"):
