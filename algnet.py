@@ -52,16 +52,16 @@ def cfg():
     misr_reinit_iv = 500
     misr_reinit_lim = 1000
     batch_size = 100
-    bidders = 5
-    items = 10
-    net_width = 200
-    net_depth = 7
+    bidders = 2
+    items = 2
+    hidden_width = 50
+    n_hidden = 2
     learning_rate = 0.001
     rng_seed_training = 1729
     rng_seed_test = 1337
     misreport_type = 'uniform'  # Can be 'uniform' or 'normal'
-    misreport_params = {'low': 0., 'high': 1.}  # Example for uniform distribution
-    attack_mode = 'offline'  # Can be 'online' or 'offline'
+    misreport_params = {'low': 0., 'high': 1.0}  # Example for uniform distribution
+    attack_mode = 'offline'  # Can be 'online' or 'offline' or None
     # val_dist = ...  # TODO: add when ready
 
 
@@ -120,32 +120,84 @@ class ValuationMisreporterOffline:
 
         return jnp.stack(modified_samples, axis=0)
 
-class ValuationMisreporterOnline(hk.Module):
+     
+class OnlineMisreporter(hk.Module):
     """Online Misreporter network using an MLP for generating misreports."""
-    def __init__(self, rng, bidders, items, net_width, net_depth, name=None):
+    def __init__(self, bidders, items, hidden_width, n_hidden, name=None):
         super().__init__(name=name)
         self.bidders = bidders
         self.items = items
-        self.net_width = net_width
-        self.net_depth = net_depth
-        self.key = rng
-        self.mlp = MLP([self.bidders * self.items, self.net_width, self.net_depth, self.items], activation=jnp.tanh)
+        self.hidden_width = hidden_width
+        self.n_hidden = n_hidden
+        
+        input_width = self.bidders * self.items
+        hidden_layers = [self.hidden_width] * self.n_hidden
+        
+        self.mlp = MLP([input_width, *hidden_layers, self.items], activation=jnp.tanh)
 
     def __call__(self, true_vals):
         misreports = self.mlp(jnp.ravel(true_vals))
         misreports = nn.sigmoid(misreports) # Assuming valuations are in [0,1]
         return misreports
 
-    def sample(self, num_samples):
-        samples = []
-        for _ in range(num_samples):
-            self.key, subkey = jax.random.split(self.key)
-            true_vals = jax.random.uniform(subkey, (self.bidders, self.items))
-            misreport = self(true_vals[0])
-            modified_sample = jnp.concatenate([misreport[None, :], true_vals[1:]], axis=0)
-            samples.append(modified_sample)
-        return jnp.stack(samples, axis=0)
+class ValuationMisreporterOnline:
+    def __init__(self, rng, bidders, items, hidden_width, n_hidden, learning_rate):
+        self.bidders = bidders
+        self.items = items
+        self.hidden_width = hidden_width
+        self.n_hidden = n_hidden
+        self.key = rng
+        
+        self.optimizer = optax.adamw(learning_rate, b1=0.9, b2=0.999)
+        
+        # Define the Haiku network transform
+        self.online_misreporter_transform = hk.without_apply_rng(
+            hk.transform(
+                lambda *args: OnlineMisreporter(
+                    self.bidders, self.items, self.hidden_width, self.n_hidden
+                )(*args)
+            )
+        )
+        
+        # Initialize the network and optimizer state
+        self.params = self.online_misreporter_transform.init(self.key, jnp.zeros((self.bidders, self.items)))
+        self.opt_state = self.optimizer.init(self.params)
 
+    def misreport_single(self, val_sample):
+        # Generate misreport for the first bidder using the MLP
+        misreport = self.online_misreporter_transform.apply(self.params, val_sample)
+
+        # Replace the truthful sample for the first bidder with the misreported sample
+        modified_sample = val_sample.at[0].set(misreport)
+
+        return modified_sample
+
+    def misreport(self, val_batch): # val_batch: (batch_size, bidders, items)
+        v_misreport = jax.vmap(functools.partial(self.misreport_single))
+        return v_misreport(val_batch)
+
+    def utility_single(self, tpal, tpal_state, misreported_sample, val_sample):
+        # Receive an auction from the current tpal_state using the misreported samples
+        auct_params = tpal_state.params.auct
+        alloc, pay = tpal.auct_transform.apply(auct_params, misreported_sample)
+
+        # Calculate utility for the first bidder using their true valuations
+        utility_first_bidder = alloc[0,:] @ val_sample[0,:] - pay[0]
+        return utility_first_bidder
+
+    def update(self, misreported_batch, val_batch, tpal, tpal_state):
+        v_utility = jax.vmap(functools.partial(self.utility_single, tpal, tpal_state))
+        utility_first_bidder_batch = v_utility(misreported_batch, val_batch)
+
+        # Define the loss function
+        def loss_fn(params):
+            utility = jnp.mean(utility_first_bidder_batch)
+            return -utility
+
+        # Update the misreporter model using Optax
+        grads = jax.grad(loss_fn)(self.params)
+        updates, self.opt_state = self.optimizer.update(grads, self.opt_state, self.params)
+        self.params = optax.apply_updates(self.params, updates)
 
 # move b_i to the front of B
 # B = [b_i, b_0, ..., b_i-1, b_i+1, ..., b_n]
@@ -165,21 +217,26 @@ def permute_along_bidders(B, i):
 class Auctioneer(hk.Module):
     """Auctioneer network."""
 
-    def __init__(self, bidders, items, net_width, net_depth, name=None):
+    def __init__(self, bidders, items, hidden_width, n_hidden, name=None):
         super().__init__(name=name)
         self.bidders = bidders
         self.items = items
-        self.net_width = net_width  # TODO: unify this between auct and misr?
-        self.net_depth = net_depth
+        self.hidden_width = hidden_width
+        self.n_hidden = n_hidden
 
-        self.layers = [self.bidders * self.items, self.net_width, self.net_depth]
-        self.layers_alloc = [*self.layers, self.items]
-        self.layers_pay = [*self.layers, 1]
+
+        input_width = self.bidders * self.items
+        hidden_layers = [self.hidden_width] * self.n_hidden
+        
+        # Layers for allocation MLPs
+        alloc_layers = [input_width, *hidden_layers, self.items]
+        # Layers for payment MLP
+        pay_layers = [input_width, *hidden_layers, 1]
 
         # Initialize MLPs
-        self.alloc_prob = MLP(self.layers_alloc, activation=jnp.tanh)
-        self.alloc_which = MLP(self.layers_alloc, activation=jnp.tanh)
-        self.pay_mlp = MLP(self.layers_pay, activation=jnp.tanh)
+        self.alloc_prob = MLP(alloc_layers, activation=jnp.tanh)
+        self.alloc_which = MLP(alloc_layers, activation=jnp.tanh)
+        self.pay_mlp = MLP(pay_layers, activation=jnp.tanh)
 
     def __call__(self, vals):
         """Computes auctions, consisting of an allocation and a payment matrix."""
@@ -238,22 +295,20 @@ class Auctioneer(hk.Module):
 class Misreporter(hk.Module):
     """Misreporter network."""
 
-    def __init__(self, bidders, items, net_width, net_depth, name=None):
+    def __init__(self, bidders, items, hidden_width, n_hidden, name=None):
         super().__init__(name=name)
         self.bidders = bidders
         self.items = items
-        self.net_width = net_width
-        self.net_depth = net_depth
+        self.hidden_width = hidden_width
+        self.n_hidden = n_hidden
 
-        self.layers = [
-            self.bidders * self.items,
-            self.net_width,
-            self.net_depth,
-            self.items,
-        ]
+        # Layers for misreporter MLP
+        input_width = self.bidders * self.items
+        hidden_layers = [self.hidden_width] * self.n_hidden
+        misr_layers = [input_width,  *hidden_layers, self.items]
 
         # Initialize MLP
-        self.misr_mlp = MLP(self.layers, activation=jnp.tanh)
+        self.misr_mlp = MLP(misr_layers, activation=jnp.tanh)
 
     def __call__(self, vals):
         """Computes (approximately) optimal misreports for a given auction."""
@@ -289,19 +344,19 @@ class TPALState(NamedTuple):
 class TPAL:
     """Two Player Auction Learner."""
 
-    def __init__(self, bidders, items, net_width, net_depth, lr):
+    def __init__(self, bidders, items, hidden_width, n_hidden, learning_rate):
         self.bidders = bidders
         self.items = items
 
-        self.net_width = net_width
-        self.net_depth = net_depth
+        self.hidden_width = hidden_width
+        self.n_hidden = n_hidden
 
         # Define the Haiku network transforms.
         # We don't use BatchNorm so we don't use `with_state`.
         self.auct_transform = hk.without_apply_rng(
             hk.transform(
                 lambda *args: Auctioneer(
-                    self.bidders, self.items, self.net_width, self.net_depth
+                    self.bidders, self.items, self.hidden_width, self.n_hidden
                 )(*args)
             )
         )
@@ -309,15 +364,15 @@ class TPAL:
         self.misr_transform = hk.without_apply_rng(
             hk.transform(
                 lambda *args: Misreporter(
-                    self.bidders, self.items, self.net_width, self.net_depth
+                    self.bidders, self.items, self.hidden_width, self.n_hidden
                 )(*args)
             )
         )
 
         # Build the optimizers.
         self.optimizers = TPALTuple(
-            auct=optax.adamw(lr, b1=0.9, b2=0.999),
-            misr=optax.adamw(lr, b1=0.9, b2=0.999),
+            auct=optax.adamw(learning_rate, b1=0.9, b2=0.999),
+            misr=optax.adamw(learning_rate, b1=0.9, b2=0.999),
         )
 
     @functools.partial(jax.jit, static_argnums=0)
@@ -331,8 +386,15 @@ class TPAL:
             misr=self.misr_transform.init(rng_misr, vals),
         )
 
-        print("Auctioneer: \n\n{}\n".format(tree_shape(params.auct)))
-        print("Misreporter: \n\n{}\n".format(tree_shape(params.misr)))
+        def print_layers(params):
+            for key, value in params.items():
+                print(f"{key}:\tb = {value['b']}\tw = {value['w']}")
+
+        print("Auctioneer:")
+        print_layers(tree_shape(params.auct))
+
+        print("\nMisreporter:")
+        print_layers(tree_shape(params.misr))
 
         # Initialize the optimizers.
         opt_state = TPALTuple(
@@ -494,12 +556,13 @@ def training(
     batch_size,
     bidders,
     items,
-    net_width,
-    net_depth,
+    hidden_width,
+    n_hidden,
     learning_rate,
     rng_seed_training,
-    bid_sampler, # BidSampler, ValuationMisreporterOffline or ValuationMisreporterOnline
-    attack_mode
+    attack_mode,
+    misreport_type,
+    misreport_params
     # val_dist, TODO: add option to use different distributions
 ):
     # @title {vertical-output: true}
@@ -507,13 +570,15 @@ def training(
     log_every = num_steps // 100
 
     # The model.
-    tpal = TPAL(bidders, items, net_width, net_depth, learning_rate)
+    tpal = TPAL(bidders, items, hidden_width, n_hidden, learning_rate)
 
     # Top-level RNG.
     rng = jax.random.PRNGKey(rng_seed_training)
 
     # Initialize the network and optimizer.
-    rng, rng_sampler, rng_state_init, rng_misr_reinit = jax.random.split(rng, 4)
+    rng, rng_sampler, rng_state_init, rng_misr_reinit, rng_val_misr = jax.random.split(rng, 5)
+
+    bid_sampler = BidSampler(rng_sampler, bidders, items)
 
     tpal_state = tpal.initial_state(rng_state_init, bid_sampler.sample(1)[0])
 
@@ -521,9 +586,18 @@ def training(
     auct_losses = []
     misr_losses = []
 
+    valuation_misreporter = None
+    match attack_mode:
+        case 'offline':
+            valuation_misreporter = ValuationMisreporterOffline(rng_val_misr, bidders, items, misreport_type=misreport_type, misreport_params=misreport_params)
+        case 'online':
+            valuation_misreporter = ValuationMisreporterOnline(rng_val_misr, bidders, items, hidden_width, n_hidden, learning_rate)
+
     for step in range(num_steps):
         # Sample valuations using bid_sampler
-        val_sample, true_val_first_bidder = bid_sampler.sample(batch_size)
+        val_sample = bid_sampler.sample(batch_size)
+
+        received_sample = valuation_misreporter.misreport(val_sample) if valuation_misreporter else val_sample
 
         if ((step % misr_reinit_iv) == 0) and (step <= misr_reinit_lim):
             tpal_state = tpal.reinit_misr(
@@ -531,18 +605,12 @@ def training(
             )
 
         for _ in range(0, misr_updates):
-            tpal_state, misr_log = tpal.update_misr(tpal_state, val_sample)
+            tpal_state, misr_log = tpal.update_misr(tpal_state, received_sample)
 
-        tpal_state, auct_log = tpal.update_auct(tpal_state, val_sample)
+        tpal_state, auct_log = tpal.update_auct(tpal_state, received_sample)
 
         if attack_mode == 'online':
-            # Receive an auction
-            auct_params = tpal_state.params.auct
-            alloc, pay = self.auct_transform.apply(auct_params, val_sample)
-            # Calculate utility for first bidder
-            utility_first_bidder = jnp.sum(alloc[0] * true_val_first_bidder) - pay[0]
-            # Update the online misreporter model
-            bid_sampler.update(utility_first_bidder)
+            valuation_misreporter.update(received_sample, val_sample, tpal, tpal_state)
 
         # Log the losses.
         if step % log_every == 0:
@@ -628,9 +696,15 @@ def run(_run, _config):
 
     # Logging Misreport Settings
     print("### Misreport Settings")
-    print(f"Misreport Type: {_config['misreport_type']}")
-    print(f"Misreport Parameters: {_config['misreport_params']}")
     print(f"Attack Mode: {_config['attack_mode']}")
+    match _config['attack_mode']:
+        case 'offline':
+            print(f"Misreport Type: {_config['misreport_type']}")
+            print(f"Misreport Parameters: {_config['misreport_params']}")
+        case 'online':
+            pass
+        case None:
+            pass
 
     # Logging Misreport Settings
     _run.log_scalar("misreport.type", _config["misreport_type"])
@@ -641,7 +715,7 @@ def run(_run, _config):
     # Training the auctioneer
     print("### Starting training")
     bid_sampler = ValuationMisreporterOffline if _config["attack_mode"] == "offline" else ValuationMisreporterOnline
-    tpal, tpal_state = training(bid_sampler=bid_sampler(_config["rng_seed_training"], _config["bidders"], _config["items"], _config["net_width"], _config["net_depth"]))  # no need to pass parameters explicitly
+    tpal, tpal_state = training()  # no need to pass parameters explicitly
 
     # Serialize and save the TPAL model state
     if not os.path.exists("tpal_state_params"):
@@ -675,3 +749,7 @@ def run(_run, _config):
         average_total_value = jnp.mean(total_values)
         _run.log_scalar(f"avg_{key}", average_total_value)
         print(f"{key}: {average_total_value}")
+
+    avg_pay, avg_regret = jnp.mean(results['pay']), jnp.mean(results['regret'])
+    avg_score = jnp.sqrt(avg_pay) - jnp.sqrt(avg_regret)
+    print(f"score: {avg_score}")
