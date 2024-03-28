@@ -59,9 +59,9 @@ def cfg():
     learning_rate = 0.001
     rng_seed_training = 1729
     rng_seed_test = 1337
-    misreport_type = 'uniform'  # Can be 'uniform' or 'normal'
-    misreport_params = {'low': 0., 'high': 1.0}  # Example for uniform distribution
-    attack_mode = 'offline'  # Can be 'online' or 'offline' or None
+    misreport_type = "uniform"  # Can be 'uniform' or 'normal'
+    misreport_params = {"low": 0.0, "high": 1.0}  # Example for uniform distribution
+    attack_mode = "offline"  # Can be 'online' or 'offline' or None
     # val_dist = ...  # TODO: add when ready
 
 
@@ -89,8 +89,11 @@ class BidSampler:
         )
         return sample
 
+
 class ValuationMisreporterOffline:
-    def __init__(self, rng, bidders, items, misreport_type='uniform', misreport_params=None):
+    def __init__(
+        self, rng, bidders, items, misreport_type="uniform", misreport_params=None
+    ):
         self.bidders = bidders
         self.items = items
         self.key = rng
@@ -103,42 +106,50 @@ class ValuationMisreporterOffline:
 
         for val_sample in val_samples:
             # Sample for the first bidder (assumed misreporting)
-            if self.misreport_type == 'uniform':
-                low = self.misreport_params.get('low', 0)
-                high = self.misreport_params.get('high', 1)
-                misreport_sample = jax.random.uniform(subkey, (1, self.items), minval=low, maxval=high)
-            elif self.misreport_type == 'normal':
-                mean = self.misreport_params.get('mean', 0)
-                stddev = self.misreport_params.get('stddev', 1)
-                misreport_sample = jax.random.normal(subkey, (1, self.items)) * stddev + mean
+            if self.misreport_type == "uniform":
+                low = self.misreport_params.get("low", 0)
+                high = self.misreport_params.get("high", 1)
+                misreport_sample = jax.random.uniform(
+                    subkey, (1, self.items), minval=low, maxval=high
+                )
+            elif self.misreport_type == "normal":
+                mean = self.misreport_params.get("mean", 0)
+                stddev = self.misreport_params.get("stddev", 1)
+                misreport_sample = (
+                    jax.random.normal(subkey, (1, self.items)) * stddev + mean
+                )
             else:
                 raise ValueError(f"Unsupported misreport type: {self.misreport_type}")
 
             # Replace the truthful sample for the first bidder with the misreported sample
-            modified_sample = jnp.concatenate([misreport_sample, val_sample[1:]], axis=0)
+            modified_sample = jnp.concatenate(
+                [misreport_sample, val_sample[1:]], axis=0
+            )
             modified_samples.append(modified_sample)
 
         return jnp.stack(modified_samples, axis=0)
 
-     
+
 class OnlineMisreporter(hk.Module):
     """Online Misreporter network using an MLP for generating misreports."""
+
     def __init__(self, bidders, items, hidden_width, n_hidden, name=None):
         super().__init__(name=name)
         self.bidders = bidders
         self.items = items
         self.hidden_width = hidden_width
         self.n_hidden = n_hidden
-        
+
         input_width = self.bidders * self.items
         hidden_layers = [self.hidden_width] * self.n_hidden
-        
+
         self.mlp = MLP([input_width, *hidden_layers, self.items], activation=jnp.tanh)
 
     def __call__(self, true_vals):
         misreports = self.mlp(jnp.ravel(true_vals))
-        misreports = nn.sigmoid(misreports) # Assuming valuations are in [0,1]
+        misreports = nn.sigmoid(misreports)  # Assuming valuations are in [0,1]
         return misreports
+
 
 class ValuationMisreporterOnline:
     def __init__(self, rng, bidders, items, hidden_width, n_hidden, learning_rate):
@@ -147,9 +158,9 @@ class ValuationMisreporterOnline:
         self.hidden_width = hidden_width
         self.n_hidden = n_hidden
         self.key = rng
-        
+
         self.optimizer = optax.adamw(learning_rate, b1=0.9, b2=0.999)
-        
+
         # Define the Haiku network transform
         self.online_misreporter_transform = hk.without_apply_rng(
             hk.transform(
@@ -158,9 +169,11 @@ class ValuationMisreporterOnline:
                 )(*args)
             )
         )
-        
+
         # Initialize the network and optimizer state
-        self.params = self.online_misreporter_transform.init(self.key, jnp.zeros((self.bidders, self.items)))
+        self.params = self.online_misreporter_transform.init(
+            self.key, jnp.zeros((self.bidders, self.items))
+        )
         self.opt_state = self.optimizer.init(self.params)
 
     def misreport_single(self, val_sample):
@@ -172,7 +185,7 @@ class ValuationMisreporterOnline:
 
         return modified_sample
 
-    def misreport(self, val_batch): # val_batch: (batch_size, bidders, items)
+    def misreport(self, val_batch):  # val_batch: (batch_size, bidders, items)
         v_misreport = jax.vmap(functools.partial(self.misreport_single))
         return v_misreport(val_batch)
 
@@ -182,7 +195,7 @@ class ValuationMisreporterOnline:
         alloc, pay = tpal.auct_transform.apply(auct_params, misreported_sample)
 
         # Calculate utility for the first bidder using their true valuations
-        utility_first_bidder = alloc[0,:] @ val_sample[0,:] - pay[0]
+        utility_first_bidder = alloc[0, :] @ val_sample[0, :] - pay[0]
         return utility_first_bidder
 
     def update(self, misreported_batch, val_batch, tpal, tpal_state):
@@ -196,8 +209,11 @@ class ValuationMisreporterOnline:
 
         # Update the misreporter model using Optax
         grads = jax.grad(loss_fn)(self.params)
-        updates, self.opt_state = self.optimizer.update(grads, self.opt_state, self.params)
+        updates, self.opt_state = self.optimizer.update(
+            grads, self.opt_state, self.params
+        )
         self.params = optax.apply_updates(self.params, updates)
+
 
 # move b_i to the front of B
 # B = [b_i, b_0, ..., b_i-1, b_i+1, ..., b_n]
@@ -224,10 +240,9 @@ class Auctioneer(hk.Module):
         self.hidden_width = hidden_width
         self.n_hidden = n_hidden
 
-
         input_width = self.bidders * self.items
         hidden_layers = [self.hidden_width] * self.n_hidden
-        
+
         # Layers for allocation MLPs
         alloc_layers = [input_width, *hidden_layers, self.items]
         # Layers for payment MLP
@@ -305,7 +320,7 @@ class Misreporter(hk.Module):
         # Layers for misreporter MLP
         input_width = self.bidders * self.items
         hidden_layers = [self.hidden_width] * self.n_hidden
-        misr_layers = [input_width,  *hidden_layers, self.items]
+        misr_layers = [input_width, *hidden_layers, self.items]
 
         # Initialize MLP
         self.misr_mlp = MLP(misr_layers, activation=jnp.tanh)
@@ -576,7 +591,9 @@ def training(
     rng = jax.random.PRNGKey(rng_seed_training)
 
     # Initialize the network and optimizer.
-    rng, rng_sampler, rng_state_init, rng_misr_reinit, rng_val_misr = jax.random.split(rng, 5)
+    rng, rng_sampler, rng_state_init, rng_misr_reinit, rng_val_misr = jax.random.split(
+        rng, 5
+    )
 
     bid_sampler = BidSampler(rng_sampler, bidders, items)
 
@@ -588,16 +605,28 @@ def training(
 
     valuation_misreporter = None
     match attack_mode:
-        case 'offline':
-            valuation_misreporter = ValuationMisreporterOffline(rng_val_misr, bidders, items, misreport_type=misreport_type, misreport_params=misreport_params)
-        case 'online':
-            valuation_misreporter = ValuationMisreporterOnline(rng_val_misr, bidders, items, hidden_width, n_hidden, learning_rate)
+        case "offline":
+            valuation_misreporter = ValuationMisreporterOffline(
+                rng_val_misr,
+                bidders,
+                items,
+                misreport_type=misreport_type,
+                misreport_params=misreport_params,
+            )
+        case "online":
+            valuation_misreporter = ValuationMisreporterOnline(
+                rng_val_misr, bidders, items, hidden_width, n_hidden, learning_rate
+            )
 
     for step in range(num_steps):
         # Sample valuations using bid_sampler
         val_sample = bid_sampler.sample(batch_size)
 
-        received_sample = valuation_misreporter.misreport(val_sample) if valuation_misreporter else val_sample
+        received_sample = (
+            valuation_misreporter.misreport(val_sample)
+            if valuation_misreporter
+            else val_sample
+        )
 
         if ((step % misr_reinit_iv) == 0) and (step <= misr_reinit_lim):
             tpal_state = tpal.reinit_misr(
@@ -609,7 +638,7 @@ def training(
 
         tpal_state, auct_log = tpal.update_auct(tpal_state, received_sample)
 
-        if attack_mode == 'online':
+        if attack_mode == "online":
             valuation_misreporter.update(received_sample, val_sample, tpal, tpal_state)
 
         # Log the losses.
@@ -697,11 +726,11 @@ def run(_run, _config):
     # Logging Misreport Settings
     print("### Misreport Settings")
     print(f"Attack Mode: {_config['attack_mode']}")
-    match _config['attack_mode']:
-        case 'offline':
+    match _config["attack_mode"]:
+        case "offline":
             print(f"Misreport Type: {_config['misreport_type']}")
             print(f"Misreport Parameters: {_config['misreport_params']}")
-        case 'online':
+        case "online":
             pass
         case None:
             pass
@@ -714,7 +743,11 @@ def run(_run, _config):
 
     # Training the auctioneer
     print("### Starting training")
-    bid_sampler = ValuationMisreporterOffline if _config["attack_mode"] == "offline" else ValuationMisreporterOnline
+    bid_sampler = (
+        ValuationMisreporterOffline
+        if _config["attack_mode"] == "offline"
+        else ValuationMisreporterOnline
+    )
     tpal, tpal_state = training()  # no need to pass parameters explicitly
 
     # Serialize and save the TPAL model state
@@ -750,6 +783,6 @@ def run(_run, _config):
         _run.log_scalar(f"avg_{key}", average_total_value)
         print(f"{key}: {average_total_value}")
 
-    avg_pay, avg_regret = jnp.mean(results['pay']), jnp.mean(results['regret'])
+    avg_pay, avg_regret = jnp.mean(results["pay"]), jnp.mean(results["regret"])
     avg_score = jnp.sqrt(avg_pay) - jnp.sqrt(avg_regret)
     print(f"score: {avg_score}")
