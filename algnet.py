@@ -61,7 +61,7 @@ def cfg():
     rng_seed_test = 1337
     misreport_type = "uniform"  # Can be 'uniform' or 'normal'
     misreport_params = {"low": 0.0, "high": 1.0}  # Example for uniform distribution
-    attack_mode = "offline"  # Can be 'online' or 'offline' or None
+    attack_mode = "online" # Can be 'online' or 'offline' or None
     # val_dist = ...  # TODO: add when ready
 
 
@@ -386,8 +386,8 @@ class TPAL:
 
         # Build the optimizers. We use differentially private SGD.
         self.optimizers = TPALTuple(
-            auct=optax.contrib.dpsgd(learning_rate,10000,1,1),
-            misr=optax.contrib.dpsgd(learning_rate,10000,1,1),
+            auct=optax.contrib.dpsgd(learning_rate, 1.0, 1.1, 1337, 0.9, True),
+            misr=optax.contrib.dpsgd(learning_rate, 1.0, 1.1, 2342, 0.9, True),
         )
 
 
