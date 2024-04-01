@@ -766,6 +766,7 @@ def run(_run, _config):
     results = test(tpal, tpal_state, num_samples, _config["rng_seed_test"])
 
     print(f"### Average test results ({num_samples} samples)")
+    averages = {}
     for key, matrix in results.items():
         # Save the matrix to a temporary file
         temp_filename = f"temp_{key}.pkl"
@@ -782,7 +783,7 @@ def run(_run, _config):
         average_total_value = jnp.mean(total_values)
         _run.log_scalar(f"avg_{key}", average_total_value)
         print(f"{key}: {average_total_value}")
+        averages[key] = average_total_value
 
-    avg_pay, avg_regret = jnp.mean(results["pay"]), jnp.mean(results["regret"])
-    avg_score = jnp.sqrt(avg_pay) - jnp.sqrt(avg_regret)
+    avg_score = jnp.sqrt(averages["pay"]) - jnp.sqrt(averages["regret"])
     print(f"score: {avg_score}")
