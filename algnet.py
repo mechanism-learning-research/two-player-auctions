@@ -384,11 +384,12 @@ class TPAL:
             )
         )
 
-        # Build the optimizers.
+        # Build the optimizers. We use differentially private SGD.
         self.optimizers = TPALTuple(
-            auct=optax.adamw(learning_rate, b1=0.9, b2=0.999),
-            misr=optax.adamw(learning_rate, b1=0.9, b2=0.999),
+            auct=optax.contrib.dpsgd(learning_rate,10000,1,1),
+            misr=optax.contrib.dpsgd(learning_rate,10000,1,1),
         )
+
 
     @functools.partial(jax.jit, static_argnums=0)
     def initial_state(self, rng, vals):
@@ -522,9 +523,15 @@ class TPAL:
     def update_auct(self, tpal_state, batch):
         """Performs a parameter update."""
         # Update the generator.
-        auct_loss, auct_grads = jax.value_and_grad(self.v_auct_loss)(
+        auct_loss = self.v_auct_loss(
             tpal_state.params.auct, tpal_state.params.misr, batch
         )
+
+        # Uses jax.vmap across the batch to extract per-example gradients.
+        grad_fn = jax.vmap(jax.grad(self.auct_loss), in_axes=(None, None, 0))
+        auct_grads = grad_fn(tpal_state.params.auct, tpal_state.params.misr, batch)
+
+
         auct_update, auct_opt_state = self.optimizers.auct.update(
             auct_grads, tpal_state.opt_state.auct, tpal_state.params.auct
         )
@@ -542,9 +549,13 @@ class TPAL:
     def update_misr(self, tpal_state, batch):
         """Performs a parameter update."""
         # Update the misreporter.
-        misr_loss, misr_grads = jax.value_and_grad(self.v_misr_loss)(
+        misr_loss = self.v_misr_loss(
             tpal_state.params.misr, tpal_state.params.auct, batch
         )  # NOTE: Params of the network to be updated need to be the first arg.
+
+        # Uses jax.vmap across the batch to extract per-example gradients.
+        grad_fn = jax.vmap(jax.grad(self.misr_loss), in_axes=(None, None, 0))
+        misr_grads = grad_fn(tpal_state.params.misr, tpal_state.params.auct, batch)
 
         misr_update, misr_opt_state = self.optimizers.misr.update(
             misr_grads, tpal_state.opt_state.misr, tpal_state.params.misr
