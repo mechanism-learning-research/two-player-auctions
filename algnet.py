@@ -59,9 +59,9 @@ def cfg():
     learning_rate = 0.001
     rng_seed_training = 1729
     rng_seed_test = 1337
+    attack_mode = None  # Can be 'online' or 'offline' or None
     misreport_type = "uniform"  # Can be 'uniform' or 'normal'
-    misreport_params = {"low": 0.0, "high": 1.0}  # Example for uniform distribution
-    attack_mode = "offline"  # Can be 'online' or 'offline' or None
+    misreport_params = {}
     # val_dist = ...  # TODO: add when ready
 
 
