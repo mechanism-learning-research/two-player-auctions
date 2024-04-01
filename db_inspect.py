@@ -5,6 +5,12 @@ from tabulate import tabulate
 import jax
 import jax.numpy as jnp
 import pickle  # Assuming the content is pickled
+import argparse
+
+# Add argument parser
+parser = argparse.ArgumentParser()
+parser.add_argument("--baselines-only", action="store_true", help="Check baselines only")
+args = parser.parse_args()
 
 # Connect to the database
 conn = sqlite3.connect("results.db")
@@ -26,14 +32,33 @@ config_keys = [
     "misr_reinit_iv",
     "misr_reinit_lim",
     "batch_size",
-    "net_width",
-    "net_depth",
+    "hidden_width",
+    "n_hidden",
     "learning_rate",
     "rng_seed_training",
     "rng_seed_test",
+    "attack_mode"
 ]
 
-headers = ["Bidders", "Items", "Score", "Regret", "Revenue"] + config_keys
+headers = [
+    "run id",
+    "bidders",
+    "items",
+    "score",
+    "regret",
+    "revenue",
+    "steps",
+    "misr\nreinit iv",
+    "misr\nreinit lim",
+    "batch\nsize",
+    "hidden\nwidth",
+    "num\nhidden",
+    "lr",
+    "seed\ntrain",
+    "seed\ntest",
+    "attack"
+]
+
 rows = []
 
 for row in cursor.fetchall():
@@ -59,11 +84,14 @@ for row in cursor.fetchall():
             regret = average_total_value if average_total_value is not None else 0
             model_score = (pay**0.5) - max(0, regret) ** 0.5
 
+            # if key is not in config, skip
+            if not all(key in config for key in config_keys):
+                continue
             # Add the data to the rows list in markdown table format
             config_data = [config[key] for key in config_keys]
-            if config["misr_updates"] == 100 and config["num_test_samples"] == 10000:
+            if not args.baselines_only or (args.baselines_only and config.get("misr_updates") == 100 and config.get("num_test_samples") == 10000):
                 rows.append(
-                    [config["bidders"], config["items"], model_score, regret, pay]
+                    [run_id, config["bidders"], config["items"], model_score, regret, pay]
                     + config_data
                 )
 
