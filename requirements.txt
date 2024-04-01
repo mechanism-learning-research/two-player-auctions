@@ -1,5 +1,5 @@
 absl-py==2.0.0
-chex==0.1.83
+chex==0.1.86
 colorama==0.4.6
 dm-haiku==0.0.10
 docopt==0.6.2
@@ -14,7 +14,7 @@ ml-dtypes==0.3.1
 munch==2.5.0
 numpy==1.26.0
 opt-einsum==3.3.0
-optax==0.1.7
+optax==0.2.2
 packaging==23.2
 py-cpuinfo==9.0.0
 sacred==0.8.4
