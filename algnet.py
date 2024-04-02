@@ -36,6 +36,9 @@ import joblib
 from sacred import Experiment
 from sacred.observers import SqlObserver
 
+from optax._src import linear_algebra
+
+
 # Create a new experiment
 ex = Experiment("auction_experiment")
 
@@ -359,12 +362,14 @@ class TPALState(NamedTuple):
 class TPAL:
     """Two Player Auction Learner."""
 
-    def __init__(self, bidders, items, hidden_width, n_hidden, learning_rate):
+    def __init__(self, bidders, items, hidden_width, n_hidden, learning_rate, dp=False, norm_clip_auct=1.0, norm_clip_misr=1.0, noise_ratio_auct=0.0, noise_ratio_misr=0.0):
         self.bidders = bidders
         self.items = items
 
         self.hidden_width = hidden_width
         self.n_hidden = n_hidden
+
+        self.dp = dp
 
         # Define the Haiku network transforms.
         # We don't use BatchNorm so we don't use `with_state`.
@@ -386,8 +391,11 @@ class TPAL:
 
         # Build the optimizers. We use differentially private SGD.
         self.optimizers = TPALTuple(
-            auct=optax.contrib.dpsgd(learning_rate, 10.07, 0.9, 1337, 0.9, True),
-            misr=optax.contrib.dpsgd(learning_rate, 1.32,  0.9, 2342, 0.9, True),
+            auct=optax.sgd(learning_rate, 0.9, True),
+            misr=optax.sgd(learning_rate, 0.9, True),
+        ) if not self.dp else TPALTuple(
+            auct=optax.contrib.dpsgd(learning_rate, norm_clip_auct, noise_ratio_auct, 1337, 0.9, True),
+            misr=optax.contrib.dpsgd(learning_rate, norm_clip_misr, noise_ratio_misr, 2342, 0.9, True),
         )
 
 
@@ -519,24 +527,21 @@ class TPAL:
         v_ml = jax.vmap(functools.partial(self.misr_loss, misr_params, auct_params))
         return jnp.mean(v_ml(val_batch))
 
+    def grad_norm(self, grads):
+        return linear_algebra.global_norm(grads) if not self.dp else jnp.median(jax.vmap(linear_algebra.global_norm)(grads))
+
     @functools.partial(jax.jit, static_argnums=0)
     def update_auct(self, tpal_state, batch):
         """Performs a parameter update."""
         # Update the generator.
-        auct_loss = self.v_auct_loss(
+        auct_loss, auct_grads = jax.value_and_grad(self.v_auct_loss)(
             tpal_state.params.auct, tpal_state.params.misr, batch
         )
 
-        # Uses jax.vmap across the batch to extract per-example gradients.
-        grad_fn = jax.vmap(jax.grad(self.auct_loss), in_axes=(None, None, 0))
-        auct_grads = grad_fn(tpal_state.params.auct, tpal_state.params.misr, batch)
-
-        # Concatenate and flatten all bias and weight gradients
-        all_gradients = jnp.concatenate([jnp.ravel(gradients['b']) for gradients in auct_grads.values()] +
-                                [jnp.ravel(gradients['w']) for gradients in auct_grads.values()])
-
-        # Compute the total gradient norm
-        total_gradient_norm = jnp.linalg.norm(all_gradients)
+        if self.dp:
+            # Uses jax.vmap across the batch to extract per-example gradients.
+            grad_fn = jax.vmap(jax.grad(self.auct_loss), in_axes=(None, None, 0))
+            auct_grads = grad_fn(tpal_state.params.auct, tpal_state.params.misr, batch)
 
         auct_update, auct_opt_state = self.optimizers.auct.update(
             auct_grads, tpal_state.opt_state.auct, tpal_state.params.auct
@@ -548,7 +553,7 @@ class TPAL:
         tpal_state = TPALState(params=params, opt_state=opt_state)
         log = {
             "auct_loss": auct_loss,
-            "auct_grad_norm": total_gradient_norm
+            "auct_grad_norm": self.grad_norm(auct_grads)
         }
         return tpal_state, log
 
@@ -556,20 +561,14 @@ class TPAL:
     def update_misr(self, tpal_state, batch):
         """Performs a parameter update."""
         # Update the misreporter.
-        misr_loss = self.v_misr_loss(
+        misr_loss, misr_grads = jax.value_and_grad(self.v_misr_loss)(
             tpal_state.params.misr, tpal_state.params.auct, batch
         )  # NOTE: Params of the network to be updated need to be the first arg.
 
-        # Uses jax.vmap across the batch to extract per-example gradients.
-        grad_fn = jax.vmap(jax.grad(self.misr_loss), in_axes=(None, None, 0))
-        misr_grads = grad_fn(tpal_state.params.misr, tpal_state.params.auct, batch)
-
-        # Concatenate and flatten all bias and weight gradients
-        all_gradients = jnp.concatenate([jnp.ravel(gradients['b']) for gradients in misr_grads.values()] +
-                                [jnp.ravel(gradients['w']) for gradients in misr_grads.values()])
-
-        # Compute the total gradient norm
-        total_gradient_norm = jnp.linalg.norm(all_gradients)
+        if self.dp:
+            # Uses jax.vmap across the batch to extract per-example gradients.
+            grad_fn = jax.vmap(jax.grad(self.misr_loss), in_axes=(None, None, 0))
+            misr_grads = grad_fn(tpal_state.params.misr, tpal_state.params.auct, batch)
 
         misr_update, misr_opt_state = self.optimizers.misr.update(
             misr_grads, tpal_state.opt_state.misr, tpal_state.params.misr
@@ -581,7 +580,7 @@ class TPAL:
         tpal_state = TPALState(params=params, opt_state=opt_state)
         log = {
             "misr_loss": misr_loss,
-            "misr_grad_norm": total_gradient_norm
+            "misr_grad_norm": self.grad_norm(misr_grads)
         }
         return tpal_state, log
 
@@ -611,7 +610,7 @@ def training(
     log_every = num_steps // 100
 
     # The model.
-    tpal = TPAL(bidders, items, hidden_width, n_hidden, learning_rate)
+    tpal = TPAL(bidders, items, hidden_width, n_hidden, learning_rate, True, 0.99, 0.13, 0.9, 0.9)
 
     # Top-level RNG.
     rng = jax.random.PRNGKey(rng_seed_training)
