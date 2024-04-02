@@ -386,8 +386,8 @@ class TPAL:
 
         # Build the optimizers. We use differentially private SGD.
         self.optimizers = TPALTuple(
-            auct=optax.contrib.dpsgd(learning_rate, 1.0, 1.1, 1337, 0.9, True),
-            misr=optax.contrib.dpsgd(learning_rate, 1.0, 1.1, 2342, 0.9, True),
+            auct=optax.contrib.dpsgd(learning_rate, 10.07, 0.9, 1337, 0.9, True),
+            misr=optax.contrib.dpsgd(learning_rate, 1.32,  0.9, 2342, 0.9, True),
         )
 
 
@@ -531,6 +531,12 @@ class TPAL:
         grad_fn = jax.vmap(jax.grad(self.auct_loss), in_axes=(None, None, 0))
         auct_grads = grad_fn(tpal_state.params.auct, tpal_state.params.misr, batch)
 
+        # Concatenate and flatten all bias and weight gradients
+        all_gradients = jnp.concatenate([jnp.ravel(gradients['b']) for gradients in auct_grads.values()] +
+                                [jnp.ravel(gradients['w']) for gradients in auct_grads.values()])
+
+        # Compute the total gradient norm
+        total_gradient_norm = jnp.linalg.norm(all_gradients)
 
         auct_update, auct_opt_state = self.optimizers.auct.update(
             auct_grads, tpal_state.opt_state.auct, tpal_state.params.auct
@@ -542,6 +548,7 @@ class TPAL:
         tpal_state = TPALState(params=params, opt_state=opt_state)
         log = {
             "auct_loss": auct_loss,
+            "auct_grad_norm": total_gradient_norm
         }
         return tpal_state, log
 
@@ -557,6 +564,13 @@ class TPAL:
         grad_fn = jax.vmap(jax.grad(self.misr_loss), in_axes=(None, None, 0))
         misr_grads = grad_fn(tpal_state.params.misr, tpal_state.params.auct, batch)
 
+        # Concatenate and flatten all bias and weight gradients
+        all_gradients = jnp.concatenate([jnp.ravel(gradients['b']) for gradients in misr_grads.values()] +
+                                [jnp.ravel(gradients['w']) for gradients in misr_grads.values()])
+
+        # Compute the total gradient norm
+        total_gradient_norm = jnp.linalg.norm(all_gradients)
+
         misr_update, misr_opt_state = self.optimizers.misr.update(
             misr_grads, tpal_state.opt_state.misr, tpal_state.params.misr
         )
@@ -567,6 +581,7 @@ class TPAL:
         tpal_state = TPALState(params=params, opt_state=opt_state)
         log = {
             "misr_loss": misr_loss,
+            "misr_grad_norm": total_gradient_norm
         }
         return tpal_state, log
 
@@ -610,9 +625,7 @@ def training(
 
     tpal_state = tpal.initial_state(rng_state_init, bid_sampler.sample(1)[0])
 
-    steps = []
-    auct_losses = []
-    misr_losses = []
+    auct_grad_norms, misr_grad_norms = [], []
 
     valuation_misreporter = None
     match attack_mode:
@@ -652,6 +665,9 @@ def training(
         if attack_mode == "online":
             valuation_misreporter.update(received_sample, val_sample, tpal, tpal_state)
 
+        auct_grad_norms.append(auct_log["auct_grad_norm"])
+        misr_grad_norms.append(misr_log["misr_grad_norm"])
+
         # Log the losses.
         if step % log_every == 0:
             # It's important to call `device_get` here so we don't take up device
@@ -663,16 +679,16 @@ def training(
             misr_loss = misr_log["misr_loss"]
             print(
                 f"Step {step}: "
-                f"auct_loss = {auct_loss:.3f}, misr_loss = {misr_loss:.3f}"
+                f"auct_loss = {auct_loss:.3f}, misr_loss = {misr_loss:.3f}, auct_grad_norm = {auct_log['auct_grad_norm']:.3f}, misr_grad_norm = {misr_log['misr_grad_norm']:.3f}"
             )
 
             # Logging Losses
             _run.log_scalar("losses.auct_loss", auct_loss, step)
             _run.log_scalar("losses.misr_loss", misr_loss, step)
 
-            steps.append(step)
-            auct_losses.append(auct_loss)
-            misr_losses.append(misr_loss)
+    
+    print("Median Auct Grad Norm:", jnp.median(jnp.array(auct_grad_norms)))
+    print("Median Misr Grad Norm:", jnp.median(jnp.array(misr_grad_norms)))
 
     return tpal, tpal_state
 
