@@ -65,6 +65,7 @@ def cfg():
     attack_mode = None  # Can be 'online' or 'offline' or None
     misreport_type = "uniform"  # Can be 'uniform' or 'normal'
     misreport_params = {}
+    dp = False
     # val_dist = ...  # TODO: add when ready
 
 
@@ -162,7 +163,7 @@ class ValuationMisreporterOnline:
         self.n_hidden = n_hidden
         self.key = rng
 
-        self.optimizer = optax.adamw(learning_rate, b1=0.9, b2=0.999)
+        self.optimizer = optax.sgd(learning_rate, 0.9, True)
 
         # Define the Haiku network transform
         self.online_misreporter_transform = hk.without_apply_rng(
@@ -366,7 +367,7 @@ class TPALState(NamedTuple):
 class TPAL:
     """Two Player Auction Learner."""
 
-    def __init__(self, bidders, items, hidden_width, n_hidden, learning_rate, dp=False, norm_clip_auct=1.0, norm_clip_misr=1.0, noise_ratio_auct=0.0, noise_ratio_misr=0.0):
+    def __init__(self, bidders, items, hidden_width, n_hidden, learning_rate, dp=False, norm_clip_auct=1.0, norm_clip_misr=1.0, noise_ratio_auct=0.9, noise_ratio_misr=0.9):
         self.bidders = bidders
         self.items = items
 
@@ -423,6 +424,7 @@ class TPAL:
 
         print("\nMisreporter:")
         print_layers(tree_shape(params.misr))
+        print()
 
         # Initialize the optimizers.
         opt_state = TPALTuple(
@@ -586,15 +588,47 @@ def training(
     rng_seed_training,
     attack_mode,
     misreport_type,
-    misreport_params
+    misreport_params,
+    dp
     # val_dist, TODO: add option to use different distributions
 ):
     # @title {vertical-output: true}
 
     log_every = num_steps // 100
 
+    norm_clip_auct, norm_clip_misr = None, None
+    if dp:
+        print("#### Calibrating norm clip value for dpsgd.")
+        print("Training will run for 1000 steps without differential privacy.")
+        print()
+        _, _, norm_clip_auct, norm_clip_misr = training(
+            _run,
+            1000,
+            misr_updates,
+            misr_reinit_iv,
+            misr_reinit_lim,
+            batch_size,
+            bidders,
+            items,
+            hidden_width,
+            n_hidden,
+            learning_rate,
+            rng_seed_training,
+            None, # no attack during calibration
+            misreport_type,
+            misreport_params,
+            False # no dp during calibration
+        )
+
+        print()
+        print("Calibration complete!")
+        print("Median Auct Grad Norm:", norm_clip_auct)
+        print("Median Misr Grad Norm:", norm_clip_misr)
+        print()
+        print("#### Starting training with differential privacy.")
+
     # The model.
-    tpal = TPAL(bidders, items, hidden_width, n_hidden, learning_rate, True, 0.99, 0.13, 0.9, 0.9)
+    tpal = TPAL(bidders, items, hidden_width, n_hidden, learning_rate, dp, norm_clip_auct, norm_clip_misr)
 
     # Top-level RNG.
     rng = jax.random.PRNGKey(rng_seed_training)
@@ -670,10 +704,10 @@ def training(
             _run.log_scalar("losses.misr_loss", misr_loss, step)
 
     
-    print("Median Auct Grad Norm:", jnp.median(jnp.array(auct_grad_norms)))
-    print("Median Misr Grad Norm:", jnp.median(jnp.array(misr_grad_norms)))
+    med_auct_grad_norm = jnp.median(jnp.array(auct_grad_norms))
+    med_misr_grad_norm = jnp.median(jnp.array(misr_grad_norms))
 
-    return tpal, tpal_state
+    return tpal, tpal_state, med_auct_grad_norm, med_misr_grad_norm
 
 
 # TODO vectorize and process all samples in parallel
@@ -753,7 +787,7 @@ def run(_run, _config):
 
     # Training the auctioneer
     print("### Starting training")
-    tpal, tpal_state = training()  # no need to pass parameters explicitly
+    tpal, tpal_state, _, _ = training()  # no need to pass parameters explicitly
 
     # Serialize and save the TPAL model state
     if not os.path.exists("tpal_state_params"):
@@ -766,11 +800,11 @@ def run(_run, _config):
     ex.add_artifact(state_params_filename)
 
     # Testing the auctioneer
-    print("### Starting test")
+    print("\n### Starting test")
     num_samples = _config["num_test_samples"]
     results = test(tpal, tpal_state, num_samples, _config["rng_seed_test"])
 
-    print(f"### Average test results ({num_samples} samples)")
+    print(f"#### Average test results ({num_samples} samples)")
     averages = {}
     for key, matrix in results.items():
         # Save the matrix to a temporary file
@@ -791,4 +825,4 @@ def run(_run, _config):
         averages[key] = average_total_value
 
     avg_score = jnp.sqrt(averages["pay"]) - jnp.sqrt(averages["regret"])
-    print(f"score: {avg_score}")
+    print(f"score: {avg_score}\n")
