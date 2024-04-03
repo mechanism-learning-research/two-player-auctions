@@ -36,7 +36,7 @@ import joblib
 from sacred import Experiment
 from sacred.observers import SqlObserver
 
-from optax._src import linear_algebra
+from optax._src.linear_algebra import global_norm
 
 
 # Create a new experiment
@@ -353,6 +353,10 @@ class TPALTuple(NamedTuple):
     auct: Any
     misr: Any
 
+    def __getitem__(self, item):
+        if isinstance(item, int):
+            item = self._fields[item]
+        return getattr(self, item)
 
 class TPALState(NamedTuple):
     params: TPALTuple
@@ -518,72 +522,52 @@ class TPAL:
 
         return -jnp.sum(u_misr)
 
-    # Vectorize losses to use on batches
-    def v_auct_loss(self, auct_params, misr_params, val_batch):
-        v_al = jax.vmap(functools.partial(self.auct_loss, auct_params, misr_params))
-        return jnp.mean(v_al(val_batch))
+    def update(self, target_key, tpal_state, batch):
+        """Performs a parameter update for the target key."""
+        dual_key = TPALTuple(auct="misr", misr="auct")
 
-    def v_misr_loss(self, misr_params, auct_params, val_batch):
-        v_ml = jax.vmap(functools.partial(self.misr_loss, misr_params, auct_params))
-        return jnp.mean(v_ml(val_batch))
+        loss_fn = self.auct_loss if target_key=="auct" else self.misr_loss
+        params, dual_params = tpal_state.params[target_key], tpal_state.params[dual_key[target_key]]
 
-    def grad_norm(self, grads):
-        return linear_algebra.global_norm(grads) if not self.dp else jnp.median(jax.vmap(linear_algebra.global_norm)(grads))
+        # Vectorize losses to use on batches
+        def v_loss(params, dual_params, batch):
+            vl = jax.vmap(functools.partial(loss_fn, params, dual_params))
+            return jnp.mean(vl(batch))
+
+        loss, grads = jax.value_and_grad(v_loss)(params, dual_params, batch)
+
+        if self.dp:
+            # Uses jax.vmap across the batch to extract per-example gradients.
+            grad_fn = jax.vmap(jax.grad(loss_fn), in_axes=(None, None, 0))
+            grads = grad_fn(params, dual_params, batch)
+
+        update, opt_state = self.optimizers[target_key].update(grads, tpal_state.opt_state[target_key], params)
+        updated_params = optax.apply_updates(params, update)
+
+        tpal_params = TPALTuple(
+            auct=updated_params if target_key == "auct" else tpal_state.params.auct,
+            misr=updated_params if target_key == "misr" else tpal_state.params.misr
+        )
+        tpal_opt_state = TPALTuple(
+            auct=opt_state if target_key == "auct" else tpal_state.opt_state.auct,
+            misr=opt_state if target_key == "misr" else tpal_state.opt_state.misr
+        )
+        tpal_state = TPALState(params=tpal_params, opt_state=tpal_opt_state)
+
+        grad_norm = global_norm(grads) if not self.dp else jnp.median(jax.vmap(global_norm)(grads))
+
+        return tpal_state, {
+            f"{target_key}_loss": loss,
+            f"{target_key}_grad_norm": grad_norm
+        }
 
     @functools.partial(jax.jit, static_argnums=0)
     def update_auct(self, tpal_state, batch):
-        """Performs a parameter update."""
-        # Update the generator.
-        auct_loss, auct_grads = jax.value_and_grad(self.v_auct_loss)(
-            tpal_state.params.auct, tpal_state.params.misr, batch
-        )
-
-        if self.dp:
-            # Uses jax.vmap across the batch to extract per-example gradients.
-            grad_fn = jax.vmap(jax.grad(self.auct_loss), in_axes=(None, None, 0))
-            auct_grads = grad_fn(tpal_state.params.auct, tpal_state.params.misr, batch)
-
-        auct_update, auct_opt_state = self.optimizers.auct.update(
-            auct_grads, tpal_state.opt_state.auct, tpal_state.params.auct
-        )
-        auct_params = optax.apply_updates(tpal_state.params.auct, auct_update)
-
-        params = TPALTuple(auct=auct_params, misr=tpal_state.params.misr)
-        opt_state = TPALTuple(auct=auct_opt_state, misr=tpal_state.opt_state.misr)
-        tpal_state = TPALState(params=params, opt_state=opt_state)
-        log = {
-            "auct_loss": auct_loss,
-            "auct_grad_norm": self.grad_norm(auct_grads)
-        }
-        return tpal_state, log
+        return self.update("auct", tpal_state, batch)
 
     @functools.partial(jax.jit, static_argnums=0)
     def update_misr(self, tpal_state, batch):
-        """Performs a parameter update."""
-        # Update the misreporter.
-        misr_loss, misr_grads = jax.value_and_grad(self.v_misr_loss)(
-            tpal_state.params.misr, tpal_state.params.auct, batch
-        )  # NOTE: Params of the network to be updated need to be the first arg.
-
-        if self.dp:
-            # Uses jax.vmap across the batch to extract per-example gradients.
-            grad_fn = jax.vmap(jax.grad(self.misr_loss), in_axes=(None, None, 0))
-            misr_grads = grad_fn(tpal_state.params.misr, tpal_state.params.auct, batch)
-
-        misr_update, misr_opt_state = self.optimizers.misr.update(
-            misr_grads, tpal_state.opt_state.misr, tpal_state.params.misr
-        )
-        misr_params = optax.apply_updates(tpal_state.params.misr, misr_update)
-
-        params = TPALTuple(misr=misr_params, auct=tpal_state.params.auct)
-        opt_state = TPALTuple(misr=misr_opt_state, auct=tpal_state.opt_state.auct)
-        tpal_state = TPALState(params=params, opt_state=opt_state)
-        log = {
-            "misr_loss": misr_loss,
-            "misr_grad_norm": self.grad_norm(misr_grads)
-        }
-        return tpal_state, log
-
+        return self.update("misr", tpal_state, batch)
 
 # Train a two player auction learner and return it with state.
 @ex.capture  # sacred experiment tracking decoration
@@ -769,11 +753,6 @@ def run(_run, _config):
 
     # Training the auctioneer
     print("### Starting training")
-    bid_sampler = (
-        ValuationMisreporterOffline
-        if _config["attack_mode"] == "offline"
-        else ValuationMisreporterOnline
-    )
     tpal, tpal_state = training()  # no need to pass parameters explicitly
 
     # Serialize and save the TPAL model state
