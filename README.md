@@ -69,6 +69,7 @@ python algnet.py with baseline_configs/config_2x2.json attack_mode="online" dp=T
 ```
 Initial tests suggest that this aids in achieving improved auction outcomes under attack conditions, but additional experiments are needed for confirmation.
 
+
 ## Logging and Artifacts
 
 The project uses the [Sacred](https://github.com/IDSIA/sacred) framework for experiment tracking. 
