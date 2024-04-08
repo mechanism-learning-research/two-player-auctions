@@ -359,6 +359,7 @@ class TPALTuple(NamedTuple):
             item = self._fields[item]
         return getattr(self, item)
 
+
 class TPALState(NamedTuple):
     params: TPALTuple
     opt_state: TPALTuple
@@ -367,7 +368,19 @@ class TPALState(NamedTuple):
 class TPAL:
     """Two Player Auction Learner."""
 
-    def __init__(self, bidders, items, hidden_width, n_hidden, learning_rate, dp=False, norm_clip_auct=1.0, norm_clip_misr=1.0, noise_ratio_auct=0.9, noise_ratio_misr=0.9):
+    def __init__(
+        self,
+        bidders,
+        items,
+        hidden_width,
+        n_hidden,
+        learning_rate,
+        dp=False,
+        norm_clip_auct=1.0,
+        norm_clip_misr=1.0,
+        noise_ratio_auct=0.9,
+        noise_ratio_misr=0.9,
+    ):
         self.bidders = bidders
         self.items = items
 
@@ -395,14 +408,21 @@ class TPAL:
         )
 
         # Build the optimizers. We use differentially private SGD.
-        self.optimizers = TPALTuple(
-            auct=optax.sgd(learning_rate, 0.9, True),
-            misr=optax.sgd(learning_rate, 0.9, True),
-        ) if not self.dp else TPALTuple(
-            auct=optax.contrib.dpsgd(learning_rate, norm_clip_auct, noise_ratio_auct, 1337, 0.9, True),
-            misr=optax.contrib.dpsgd(learning_rate, norm_clip_misr, noise_ratio_misr, 2342, 0.9, True),
+        self.optimizers = (
+            TPALTuple(
+                auct=optax.sgd(learning_rate, 0.9, True),
+                misr=optax.sgd(learning_rate, 0.9, True),
+            )
+            if not self.dp
+            else TPALTuple(
+                auct=optax.contrib.dpsgd(
+                    learning_rate, norm_clip_auct, noise_ratio_auct, 1337, 0.9, True
+                ),
+                misr=optax.contrib.dpsgd(
+                    learning_rate, norm_clip_misr, noise_ratio_misr, 2342, 0.9, True
+                ),
+            )
         )
-
 
     @functools.partial(jax.jit, static_argnums=0)
     def initial_state(self, rng, vals):
@@ -528,8 +548,11 @@ class TPAL:
         """Performs a parameter update for the target key."""
         dual_key = TPALTuple(auct="misr", misr="auct")
 
-        loss_fn = self.auct_loss if target_key=="auct" else self.misr_loss
-        params, dual_params = tpal_state.params[target_key], tpal_state.params[dual_key[target_key]]
+        loss_fn = self.auct_loss if target_key == "auct" else self.misr_loss
+        params, dual_params = (
+            tpal_state.params[target_key],
+            tpal_state.params[dual_key[target_key]],
+        )
 
         # Vectorize losses to use on batches
         def v_loss(params, dual_params, batch):
@@ -543,24 +566,30 @@ class TPAL:
             grad_fn = jax.vmap(jax.grad(loss_fn), in_axes=(None, None, 0))
             grads = grad_fn(params, dual_params, batch)
 
-        update, opt_state = self.optimizers[target_key].update(grads, tpal_state.opt_state[target_key], params)
+        update, opt_state = self.optimizers[target_key].update(
+            grads, tpal_state.opt_state[target_key], params
+        )
         updated_params = optax.apply_updates(params, update)
 
         tpal_params = TPALTuple(
             auct=updated_params if target_key == "auct" else tpal_state.params.auct,
-            misr=updated_params if target_key == "misr" else tpal_state.params.misr
+            misr=updated_params if target_key == "misr" else tpal_state.params.misr,
         )
         tpal_opt_state = TPALTuple(
             auct=opt_state if target_key == "auct" else tpal_state.opt_state.auct,
-            misr=opt_state if target_key == "misr" else tpal_state.opt_state.misr
+            misr=opt_state if target_key == "misr" else tpal_state.opt_state.misr,
         )
         tpal_state = TPALState(params=tpal_params, opt_state=tpal_opt_state)
 
-        grad_norm = global_norm(grads) if not self.dp else jnp.median(jax.vmap(global_norm)(grads))
+        grad_norm = (
+            global_norm(grads)
+            if not self.dp
+            else jnp.median(jax.vmap(global_norm)(grads))
+        )
 
         return tpal_state, {
             f"{target_key}_loss": loss,
-            f"{target_key}_grad_norm": grad_norm
+            f"{target_key}_grad_norm": grad_norm,
         }
 
     @functools.partial(jax.jit, static_argnums=0)
@@ -570,6 +599,7 @@ class TPAL:
     @functools.partial(jax.jit, static_argnums=0)
     def update_misr(self, tpal_state, batch):
         return self.update("misr", tpal_state, batch)
+
 
 # Train a two player auction learner and return it with state.
 @ex.capture  # sacred experiment tracking decoration
@@ -617,10 +647,10 @@ def training(
             n_hidden,
             learning_rate,
             rng_seed_training,
-            None, # no attack during calibration
+            None,  # no attack during calibration
             misreport_type,
             misreport_params,
-            False # no dp during calibration
+            False,  # no dp during calibration
         )
 
         print()
@@ -631,7 +661,16 @@ def training(
         print("#### Starting training with differential privacy.")
 
     # The model.
-    tpal = TPAL(bidders, items, hidden_width, n_hidden, learning_rate, dp, norm_clip_auct, norm_clip_misr)
+    tpal = TPAL(
+        bidders,
+        items,
+        hidden_width,
+        n_hidden,
+        learning_rate,
+        dp,
+        norm_clip_auct,
+        norm_clip_misr,
+    )
 
     # Top-level RNG.
     rng = jax.random.PRNGKey(rng_seed_training)
@@ -706,7 +745,6 @@ def training(
             _run.log_scalar("losses.auct_loss", auct_loss, step)
             _run.log_scalar("losses.misr_loss", misr_loss, step)
 
-    
     med_auct_grad_norm = jnp.median(jnp.array(auct_grad_norms))
     med_misr_grad_norm = jnp.median(jnp.array(misr_grad_norms))
 

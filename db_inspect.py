@@ -9,7 +9,9 @@ import argparse
 
 # Add argument parser
 parser = argparse.ArgumentParser()
-parser.add_argument("--baselines-only", action="store_true", help="Check baselines only")
+parser.add_argument(
+    "--baselines-only", action="store_true", help="Check baselines only"
+)
 args = parser.parse_args()
 
 # Connect to the database
@@ -37,7 +39,7 @@ config_keys = [
     "learning_rate",
     "rng_seed_training",
     "rng_seed_test",
-    "attack_mode"
+    "attack_mode",
 ]
 
 headers = [
@@ -56,7 +58,7 @@ headers = [
     "lr",
     "seed\ntrain",
     "seed\ntest",
-    "attack"
+    "attack",
 ]
 
 rows = []
@@ -89,9 +91,20 @@ for row in cursor.fetchall():
                 continue
             # Add the data to the rows list in markdown table format
             config_data = [config[key] for key in config_keys]
-            if not args.baselines_only or (args.baselines_only and config.get("misr_updates") == 100 and config.get("num_test_samples") == 10000):
+            if not args.baselines_only or (
+                args.baselines_only
+                and config.get("misr_updates") == 100
+                and config.get("num_test_samples") == 10000
+            ):
                 rows.append(
-                    [run_id, config["bidders"], config["items"], model_score, regret, pay]
+                    [
+                        run_id,
+                        config["bidders"],
+                        config["items"],
+                        model_score,
+                        regret,
+                        pay,
+                    ]
                     + config_data
                 )
 
