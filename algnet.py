@@ -597,6 +597,9 @@ def training(
     log_every = num_steps // 100
 
     norm_clip_auct, norm_clip_misr = None, None
+    # If differential privacy is used, the norm clips are automatically determined
+    # by taking the median norm of the gradients during a run without differential privacy.
+    # This has been recommended in https://arxiv.org/abs/1607.00133
     if dp:
         print("#### Calibrating norm clip value for dpsgd.")
         print("Training will run for 1000 steps without differential privacy.")
