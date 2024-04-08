@@ -36,6 +36,9 @@ import joblib
 from sacred import Experiment
 from sacred.observers import SqlObserver
 
+from optax._src.linear_algebra import global_norm
+
+
 # Create a new experiment
 ex = Experiment("auction_experiment")
 
@@ -62,6 +65,7 @@ def cfg():
     attack_mode = None  # Can be 'online' or 'offline' or None
     misreport_type = "uniform"  # Can be 'uniform' or 'normal'
     misreport_params = {}
+    dp = False
     # val_dist = ...  # TODO: add when ready
 
 
@@ -159,7 +163,7 @@ class ValuationMisreporterOnline:
         self.n_hidden = n_hidden
         self.key = rng
 
-        self.optimizer = optax.adamw(learning_rate, b1=0.9, b2=0.999)
+        self.optimizer = optax.sgd(learning_rate, 0.9, True)
 
         # Define the Haiku network transform
         self.online_misreporter_transform = hk.without_apply_rng(
@@ -350,6 +354,11 @@ class TPALTuple(NamedTuple):
     auct: Any
     misr: Any
 
+    def __getitem__(self, item):
+        if isinstance(item, int):
+            item = self._fields[item]
+        return getattr(self, item)
+
 
 class TPALState(NamedTuple):
     params: TPALTuple
@@ -359,12 +368,26 @@ class TPALState(NamedTuple):
 class TPAL:
     """Two Player Auction Learner."""
 
-    def __init__(self, bidders, items, hidden_width, n_hidden, learning_rate):
+    def __init__(
+        self,
+        bidders,
+        items,
+        hidden_width,
+        n_hidden,
+        learning_rate,
+        dp=False,
+        norm_clip_auct=1.0,
+        norm_clip_misr=1.0,
+        noise_ratio_auct=0.9,
+        noise_ratio_misr=0.9,
+    ):
         self.bidders = bidders
         self.items = items
 
         self.hidden_width = hidden_width
         self.n_hidden = n_hidden
+
+        self.dp = dp
 
         # Define the Haiku network transforms.
         # We don't use BatchNorm so we don't use `with_state`.
@@ -384,10 +407,21 @@ class TPAL:
             )
         )
 
-        # Build the optimizers.
-        self.optimizers = TPALTuple(
-            auct=optax.adamw(learning_rate, b1=0.9, b2=0.999),
-            misr=optax.adamw(learning_rate, b1=0.9, b2=0.999),
+        # Build the optimizers. We use differentially private SGD.
+        self.optimizers = (
+            TPALTuple(
+                auct=optax.sgd(learning_rate, 0.9, True),
+                misr=optax.sgd(learning_rate, 0.9, True),
+            )
+            if not self.dp
+            else TPALTuple(
+                auct=optax.contrib.dpsgd(
+                    learning_rate, norm_clip_auct, noise_ratio_auct, 1337, 0.9, True
+                ),
+                misr=optax.contrib.dpsgd(
+                    learning_rate, norm_clip_misr, noise_ratio_misr, 2342, 0.9, True
+                ),
+            )
         )
 
     @functools.partial(jax.jit, static_argnums=0)
@@ -410,6 +444,7 @@ class TPAL:
 
         print("\nMisreporter:")
         print_layers(tree_shape(params.misr))
+        print()
 
         # Initialize the optimizers.
         opt_state = TPALTuple(
@@ -509,55 +544,61 @@ class TPAL:
 
         return -jnp.sum(u_misr)
 
-    # Vectorize losses to use on batches
-    def v_auct_loss(self, auct_params, misr_params, val_batch):
-        v_al = jax.vmap(functools.partial(self.auct_loss, auct_params, misr_params))
-        return jnp.mean(v_al(val_batch))
+    def update(self, target_key, tpal_state, batch):
+        """Performs a parameter update for the target key."""
+        dual_key = TPALTuple(auct="misr", misr="auct")
 
-    def v_misr_loss(self, misr_params, auct_params, val_batch):
-        v_ml = jax.vmap(functools.partial(self.misr_loss, misr_params, auct_params))
-        return jnp.mean(v_ml(val_batch))
+        loss_fn = self.auct_loss if target_key == "auct" else self.misr_loss
+        params, dual_params = (
+            tpal_state.params[target_key],
+            tpal_state.params[dual_key[target_key]],
+        )
+
+        # Vectorize losses to use on batches
+        def v_loss(params, dual_params, batch):
+            vl = jax.vmap(functools.partial(loss_fn, params, dual_params))
+            return jnp.mean(vl(batch))
+
+        loss, grads = jax.value_and_grad(v_loss)(params, dual_params, batch)
+
+        if self.dp:
+            # Uses jax.vmap across the batch to extract per-example gradients.
+            grad_fn = jax.vmap(jax.grad(loss_fn), in_axes=(None, None, 0))
+            grads = grad_fn(params, dual_params, batch)
+
+        update, opt_state = self.optimizers[target_key].update(
+            grads, tpal_state.opt_state[target_key], params
+        )
+        updated_params = optax.apply_updates(params, update)
+
+        tpal_params = TPALTuple(
+            auct=updated_params if target_key == "auct" else tpal_state.params.auct,
+            misr=updated_params if target_key == "misr" else tpal_state.params.misr,
+        )
+        tpal_opt_state = TPALTuple(
+            auct=opt_state if target_key == "auct" else tpal_state.opt_state.auct,
+            misr=opt_state if target_key == "misr" else tpal_state.opt_state.misr,
+        )
+        tpal_state = TPALState(params=tpal_params, opt_state=tpal_opt_state)
+
+        grad_norm = (
+            global_norm(grads)
+            if not self.dp
+            else jnp.median(jax.vmap(global_norm)(grads))
+        )
+
+        return tpal_state, {
+            f"{target_key}_loss": loss,
+            f"{target_key}_grad_norm": grad_norm,
+        }
 
     @functools.partial(jax.jit, static_argnums=0)
     def update_auct(self, tpal_state, batch):
-        """Performs a parameter update."""
-        # Update the generator.
-        auct_loss, auct_grads = jax.value_and_grad(self.v_auct_loss)(
-            tpal_state.params.auct, tpal_state.params.misr, batch
-        )
-        auct_update, auct_opt_state = self.optimizers.auct.update(
-            auct_grads, tpal_state.opt_state.auct, tpal_state.params.auct
-        )
-        auct_params = optax.apply_updates(tpal_state.params.auct, auct_update)
-
-        params = TPALTuple(auct=auct_params, misr=tpal_state.params.misr)
-        opt_state = TPALTuple(auct=auct_opt_state, misr=tpal_state.opt_state.misr)
-        tpal_state = TPALState(params=params, opt_state=opt_state)
-        log = {
-            "auct_loss": auct_loss,
-        }
-        return tpal_state, log
+        return self.update("auct", tpal_state, batch)
 
     @functools.partial(jax.jit, static_argnums=0)
     def update_misr(self, tpal_state, batch):
-        """Performs a parameter update."""
-        # Update the misreporter.
-        misr_loss, misr_grads = jax.value_and_grad(self.v_misr_loss)(
-            tpal_state.params.misr, tpal_state.params.auct, batch
-        )  # NOTE: Params of the network to be updated need to be the first arg.
-
-        misr_update, misr_opt_state = self.optimizers.misr.update(
-            misr_grads, tpal_state.opt_state.misr, tpal_state.params.misr
-        )
-        misr_params = optax.apply_updates(tpal_state.params.misr, misr_update)
-
-        params = TPALTuple(misr=misr_params, auct=tpal_state.params.auct)
-        opt_state = TPALTuple(misr=misr_opt_state, auct=tpal_state.opt_state.auct)
-        tpal_state = TPALState(params=params, opt_state=opt_state)
-        log = {
-            "misr_loss": misr_loss,
-        }
-        return tpal_state, log
+        return self.update("misr", tpal_state, batch)
 
 
 # Train a two player auction learner and return it with state.
@@ -577,15 +618,59 @@ def training(
     rng_seed_training,
     attack_mode,
     misreport_type,
-    misreport_params
+    misreport_params,
+    dp
     # val_dist, TODO: add option to use different distributions
 ):
     # @title {vertical-output: true}
 
     log_every = num_steps // 100
 
+    norm_clip_auct, norm_clip_misr = None, None
+    # If differential privacy is used, the norm clips are automatically determined
+    # by taking the median norm of the gradients during a run without differential privacy.
+    # This has been recommended in https://arxiv.org/abs/1607.00133
+    if dp:
+        print("#### Calibrating norm clip value for dpsgd.")
+        print("Training will run for 1000 steps without differential privacy.")
+        print()
+        _, _, norm_clip_auct, norm_clip_misr = training(
+            _run,
+            1000,
+            misr_updates,
+            misr_reinit_iv,
+            misr_reinit_lim,
+            batch_size,
+            bidders,
+            items,
+            hidden_width,
+            n_hidden,
+            learning_rate,
+            rng_seed_training,
+            None,  # no attack during calibration
+            misreport_type,
+            misreport_params,
+            False,  # no dp during calibration
+        )
+
+        print()
+        print("Calibration complete!")
+        print("Median Auct Grad Norm:", norm_clip_auct)
+        print("Median Misr Grad Norm:", norm_clip_misr)
+        print()
+        print("#### Starting training with differential privacy.")
+
     # The model.
-    tpal = TPAL(bidders, items, hidden_width, n_hidden, learning_rate)
+    tpal = TPAL(
+        bidders,
+        items,
+        hidden_width,
+        n_hidden,
+        learning_rate,
+        dp,
+        norm_clip_auct,
+        norm_clip_misr,
+    )
 
     # Top-level RNG.
     rng = jax.random.PRNGKey(rng_seed_training)
@@ -599,9 +684,7 @@ def training(
 
     tpal_state = tpal.initial_state(rng_state_init, bid_sampler.sample(1)[0])
 
-    steps = []
-    auct_losses = []
-    misr_losses = []
+    auct_grad_norms, misr_grad_norms = [], []
 
     valuation_misreporter = None
     match attack_mode:
@@ -641,6 +724,9 @@ def training(
         if attack_mode == "online":
             valuation_misreporter.update(received_sample, val_sample, tpal, tpal_state)
 
+        auct_grad_norms.append(auct_log["auct_grad_norm"])
+        misr_grad_norms.append(misr_log["misr_grad_norm"])
+
         # Log the losses.
         if step % log_every == 0:
             # It's important to call `device_get` here so we don't take up device
@@ -652,18 +738,17 @@ def training(
             misr_loss = misr_log["misr_loss"]
             print(
                 f"Step {step}: "
-                f"auct_loss = {auct_loss:.3f}, misr_loss = {misr_loss:.3f}"
+                f"auct_loss = {auct_loss:.3f}, misr_loss = {misr_loss:.3f}, auct_grad_norm = {auct_log['auct_grad_norm']:.3f}, misr_grad_norm = {misr_log['misr_grad_norm']:.3f}"
             )
 
             # Logging Losses
             _run.log_scalar("losses.auct_loss", auct_loss, step)
             _run.log_scalar("losses.misr_loss", misr_loss, step)
 
-            steps.append(step)
-            auct_losses.append(auct_loss)
-            misr_losses.append(misr_loss)
+    med_auct_grad_norm = jnp.median(jnp.array(auct_grad_norms))
+    med_misr_grad_norm = jnp.median(jnp.array(misr_grad_norms))
 
-    return tpal, tpal_state
+    return tpal, tpal_state, med_auct_grad_norm, med_misr_grad_norm
 
 
 # TODO vectorize and process all samples in parallel
@@ -743,12 +828,7 @@ def run(_run, _config):
 
     # Training the auctioneer
     print("### Starting training")
-    bid_sampler = (
-        ValuationMisreporterOffline
-        if _config["attack_mode"] == "offline"
-        else ValuationMisreporterOnline
-    )
-    tpal, tpal_state = training()  # no need to pass parameters explicitly
+    tpal, tpal_state, _, _ = training()  # no need to pass parameters explicitly
 
     # Serialize and save the TPAL model state
     if not os.path.exists("tpal_state_params"):
@@ -761,11 +841,11 @@ def run(_run, _config):
     ex.add_artifact(state_params_filename)
 
     # Testing the auctioneer
-    print("### Starting test")
+    print("\n### Starting test")
     num_samples = _config["num_test_samples"]
     results = test(tpal, tpal_state, num_samples, _config["rng_seed_test"])
 
-    print(f"### Average test results ({num_samples} samples)")
+    print(f"#### Average test results ({num_samples} samples)")
     averages = {}
     for key, matrix in results.items():
         # Save the matrix to a temporary file
@@ -786,4 +866,4 @@ def run(_run, _config):
         averages[key] = average_total_value
 
     avg_score = jnp.sqrt(averages["pay"]) - jnp.sqrt(averages["regret"])
-    print(f"score: {avg_score}")
+    print(f"score: {avg_score}\n")

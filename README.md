@@ -61,6 +61,15 @@ To simulate an online attack, set `attack_mode="online"`.
 python algnet.py with baseline_configs/config_2x2.json attack_mode="online" num_steps=100
 ```
 
+### Training with Differential Privacy
+
+You can enable differentially private stochastic gradient descent (DPSGD) by setting `dp=True` during training.
+```
+python algnet.py with baseline_configs/config_2x2.json attack_mode="online" dp=True num_steps=1000
+```
+Initial tests suggest that this aids in achieving improved auction outcomes under attack conditions, but additional experiments are needed for confirmation.
+
+
 ## Logging and Artifacts
 
 The project uses the [Sacred](https://github.com/IDSIA/sacred) framework for experiment tracking. 
