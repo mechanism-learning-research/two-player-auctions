@@ -40,6 +40,7 @@ config_keys = [
     "rng_seed_training",
     "rng_seed_test",
     "attack_mode",
+    "dp",
 ]
 
 headers = [
@@ -59,6 +60,7 @@ headers = [
     "seed\ntrain",
     "seed\ntest",
     "attack",
+    "differential\nprivacy"
 ]
 
 rows = []
