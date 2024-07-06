@@ -410,16 +410,16 @@ class TPAL:
         # Build the optimizers. We use differentially private SGD.
         self.optimizers = (
             TPALTuple(
-                auct=optax.sgd(learning_rate, 0.9, True),
-                misr=optax.sgd(learning_rate, 0.9, True),
+                auct=optax.sgd(learning_rate, 0.8, True),
+                misr=optax.sgd(learning_rate, 0.8, True),
             )
             if not self.dp
             else TPALTuple(
                 auct=optax.contrib.dpsgd(
-                    learning_rate, norm_clip_auct, noise_ratio_auct, 1337, 0.9, True
+                    learning_rate, norm_clip_auct, noise_ratio_auct, 1337, 0.8, True
                 ),
                 misr=optax.contrib.dpsgd(
-                    learning_rate, norm_clip_misr, noise_ratio_misr, 2342, 0.9, True
+                    learning_rate, norm_clip_misr, noise_ratio_misr, 2342, 0.8, True
                 ),
             )
         )
@@ -670,6 +670,8 @@ def training(
         dp,
         norm_clip_auct,
         norm_clip_misr,
+        noise_ratio_auct,
+        noise_ratio_misr,
     )
 
     # Top-level RNG.
